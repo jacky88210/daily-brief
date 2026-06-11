@@ -1,0 +1,24 @@
+name: Send Telegram Daily Brief
+on:
+  push:
+    paths:
+      - 'daily-report/latest.json'
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Send to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          NEWS=$(jq -r '.news' daily-report/latest.json)
+          STOCK=$(jq -r '.stock' daily-report/latest.json)
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":$(echo "$NEWS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+          sleep 2
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":$(echo "$STOCK" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
