@@ -8,17 +8,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Send to Telegram
+      - name: Broadcast via Apps Script
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BROADCAST_SECRET: ${{ secrets.BROADCAST_SECRET }}
+          APPS_SCRIPT_URL: "https://script.google.com/macros/s/AKfycbyaqJYtkmtY0FVKlGPEiYYDBXrcuEYXL5EjnQSPfUD10jTulH96IDw9Yyu7ZTuoDYojLg/exec"
         run: |
           NEWS=$(jq -r '.news' daily-report/latest.json)
           STOCK=$(jq -r '.stock' daily-report/latest.json)
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          PAYLOAD=$(python3 -c "
+          import json, sys
+          news = sys.argv[1]
+          stock = sys.argv[2]
+          secret = sys.argv[3]
+          print(json.dumps({'secret': secret, 'news': news, 'stock': stock}))
+          " "$NEWS" "$STOCK" "$BROADCAST_SECRET")
+          curl -s -X POST "$APPS_SCRIPT_URL" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":$(echo "$NEWS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
-          sleep 2
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":$(echo "$STOCK" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}"
+            -d "$PAYLOAD"
