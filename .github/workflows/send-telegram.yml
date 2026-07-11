@@ -1,27 +1,41 @@
 name: Send Telegram Daily Brief
 on:
-  push:
-    paths:
-      - 'daily-report/latest.json'
+  workflow_dispatch:
+    inputs:
+      news:
+        description: 'News content'
+        required: true
+        type: string
+      stock:
+        description: 'Stock analysis content'
+        required: true
+        type: string
 jobs:
   send:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - name: Broadcast via Apps Script
         env:
           BROADCAST_SECRET: ${{ secrets.BROADCAST_SECRET }}
           APPS_SCRIPT_URL: "https://script.google.com/macros/s/AKfycbyaqJYtkmtY0FVKlGPEiYYDBXrcuEYXL5EjnQSPfUD10jTulH96IDw9Yyu7ZTuoDYojLg/exec"
+          NEWS_INPUT: ${{ inputs.news }}
+          STOCK_INPUT: ${{ inputs.stock }}
         run: |
-          NEWS=$(jq -r '.news' daily-report/latest.json)
-          STOCK=$(jq -r '.stock' daily-report/latest.json)
-          PAYLOAD=$(python3 -c "
-          import json, sys
-          news = sys.argv[1]
-          stock = sys.argv[2]
-          secret = sys.argv[3]
-          print(json.dumps({'secret': secret, 'news': news, 'stock': stock}))
-          " "$NEWS" "$STOCK" "$BROADCAST_SECRET")
-          curl -s -X POST "$APPS_SCRIPT_URL" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+          python3 << 'PYEOF'
+          import json, subprocess, os
+
+          news = os.environ['NEWS_INPUT']
+          stock = os.environ['STOCK_INPUT']
+          secret = os.environ['BROADCAST_SECRET']
+          url = os.environ['APPS_SCRIPT_URL']
+
+          payload = json.dumps({"secret": secret, "news": news, "stock": stock})
+          result = subprocess.run(
+              ["curl", "-s", "-w", "\n%{http_code}", "-X", "POST", url,
+               "-H", "Content-Type: application/json", "-d", payload],
+              capture_output=True, text=True
+          )
+          print(result.stdout)
+          if result.returncode != 0:
+              print(result.stderr)
+          PYEOF
