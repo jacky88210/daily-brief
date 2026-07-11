@@ -1,31 +1,26 @@
 name: Send Telegram Daily Brief
 on:
-  workflow_dispatch:
-    inputs:
-      news:
-        description: 'News content'
-        required: true
-        type: string
-      stock:
-        description: 'Stock analysis content'
-        required: true
-        type: string
+  push:
+    paths:
+      - 'daily-report/latest.json'
 jobs:
   send:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Broadcast via Apps Script
         env:
           BROADCAST_SECRET: ${{ secrets.BROADCAST_SECRET }}
           APPS_SCRIPT_URL: "https://script.google.com/macros/s/AKfycbyaqJYtkmtY0FVKlGPEiYYDBXrcuEYXL5EjnQSPfUD10jTulH96IDw9Yyu7ZTuoDYojLg/exec"
-          NEWS_INPUT: ${{ inputs.news }}
-          STOCK_INPUT: ${{ inputs.stock }}
         run: |
           python3 << 'PYEOF'
           import json, subprocess, os
 
-          news = os.environ['NEWS_INPUT']
-          stock = os.environ['STOCK_INPUT']
+          with open('daily-report/latest.json', encoding='utf-8') as f:
+              data = json.load(f)
+
+          news = data['news']
+          stock = data['stock']
           secret = os.environ['BROADCAST_SECRET']
           url = os.environ['APPS_SCRIPT_URL']
 
