@@ -45,61 +45,66 @@ jobs:
               tools=[Tool(google_search=GoogleSearch())]
           )
 
+          # Try models in order
+          MODELS = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
+
+          def call_gemini(prompt):
+              for model in MODELS:
+                  try:
+                      r = client.models.generate_content(
+                          model=model, contents=prompt, config=search_config
+                      )
+                      print(f"Used model: {model}")
+                      return r.text.strip()
+                  except Exception as e:
+                      print(f"Model {model} failed: {e}")
+              raise RuntimeError("All models failed")
+
           # Step 1: News
           news_prompt = f"""你是財經早報助理。今天是 {date_str}。
-          請用 Google 搜尋找今天最新資訊，用繁體中文整理以下格式（純文字，不用 * _ # ` 等符號）：
+請用 Google 搜尋找今天最新資訊，用繁體中文整理（純文字，不用 * _ # ` 等符號）：
 
-          每日早報 - {date_str}
+每日早報 - {date_str}
 
-          國際
-          - [新聞標題] (Source: [媒體名稱])
-          - [新聞標題] (Source: [媒體名稱])
-          - [新聞標題] (Source: [媒體名稱])
+國際
+- [新聞標題] (Source: [媒體名稱])
+- [新聞標題] (Source: [媒體名稱])
+- [新聞標題] (Source: [媒體名稱])
 
-          財經
-          - [新聞標題] (Source: [媒體名稱])
-          - [新聞標題] (Source: [媒體名稱])
-          - [新聞標題] (Source: [媒體名稱])
+財經
+- [新聞標題] (Source: [媒體名稱])
+- [新聞標題] (Source: [媒體名稱])
+- [新聞標題] (Source: [媒體名稱])
 
-          台灣
-          - [新聞標題] (Source: [媒體名稱])
-          - [新聞標題] (Source: [媒體名稱])
+台灣
+- [新聞標題] (Source: [媒體名稱])
+- [新聞標題] (Source: [媒體名稱])
 
-          小結
-          [2-3句：今日最核心訊號與為何重要]"""
+小結
+[2-3句：今日最核心訊號與為何重要]"""
 
-          r1 = client.models.generate_content(
-              model='gemini-2.0-flash',
-              contents=news_prompt,
-              config=search_config
-          )
-          news_text = r1.text.strip()
+          news_text = call_gemini(news_prompt)
           print("=== NEWS DONE ===")
 
           # Step 2: Stock analysis
           stock_prompt = f"""你是財經分析師。今天是 {date_str}。
-          請用 Google 搜尋找「{topic}」最新資訊，用繁體中文寫分析（純文字，不用 * _ # ` 等符號）：
+請用 Google 搜尋找「{topic}」最新資訊，用繁體中文寫分析（純文字，不用 * _ # ` 等符號）：
 
-          今日聚焦：{topic}（週{weekday_zh}輪播）
+今日聚焦：{topic}（週{weekday_zh}輪播）
 
-          [150-200字段落分析，包含最新數據與趨勢]
+[150-200字段落分析，包含最新數據與趨勢]
 
-          重點提示
-          - [重點] (Source: [媒體])
-          - [重點] (Source: [媒體])
-          - [重點] (Source: [媒體])
+重點提示
+- [重點] (Source: [媒體])
+- [重點] (Source: [媒體])
+- [重點] (Source: [媒體])
 
-          AI 觀點
-          [以「我認為」開頭，100-150字，具體分析機會或風險，點出投資人應觀察的指標]
+AI 觀點
+[以「我認為」開頭，100-150字，具體分析機會或風險，點出投資人應觀察的指標]
 
-          Sources: [媒體名稱]"""
+Sources: [媒體名稱]"""
 
-          r2 = client.models.generate_content(
-              model='gemini-2.0-flash',
-              contents=stock_prompt,
-              config=search_config
-          )
-          stock_text = r2.text.strip()
+          stock_text = call_gemini(stock_prompt)
           print("=== STOCK DONE ===")
 
           # Step 3: Broadcast via Apps Script
