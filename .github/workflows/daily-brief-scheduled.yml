@@ -4,10 +4,14 @@ on:
     - cron: '0 23 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   generate-and-send:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Generate and Send Daily Brief
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -17,3 +21,12 @@ jobs:
         run: |
           pip install -q google-genai
           echo "$SCRIPT_B64" | base64 -d | python3
+      - name: Keep repository active (prevent 60-day schedule auto-disable)
+        run: |
+          mkdir -p daily-report
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > daily-report/last-run.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add daily-report/last-run.txt
+          git diff --cached --quiet || git commit -m "chore: heartbeat $(date -u +%Y-%m-%d)"
+          git push
