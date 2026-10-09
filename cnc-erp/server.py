@@ -20,6 +20,9 @@ from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+# 直接執行 server.py 時，讓 importer / demo_data 的 `import server` 拿到同一份模組
+sys.modules.setdefault("server", sys.modules[__name__])
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 DB_PATH = os.environ.get("CNC_DB", os.path.join(BASE_DIR, "cnc.db"))
@@ -130,8 +133,11 @@ def connect(path=None):
 
 
 def init_db(path=None):
-    with connect(path) as conn:
+    conn = connect(path)
+    try:
         conn.executescript(SCHEMA)
+    finally:
+        conn.close()
 
 
 def today():
@@ -630,6 +636,7 @@ ROUTES = [
     ("POST", r"/api/workorders/(\d+)/cancel", lambda c, q, b, i: cancel_work_order(c, int(i))),
     ("GET", r"/api/stock/moves", lambda c, q, b: list_moves(c, q)),
     ("POST", r"/api/stock/adjust", lambda c, q, b: adjust_stock(c, b)),
+    ("POST", r"/api/import", lambda c, q, b: __import__("importer").run_import(c, b)),
 ]
 ROUTES = [(m, re.compile("^" + p + "$"), fn) for m, p, fn in ROUTES]
 

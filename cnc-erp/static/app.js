@@ -654,7 +654,25 @@ views.moves = async () => {
 
 views.tools = async () => {
   app.innerHTML = `
-    <h1>備份與匯出</h1>
+    <h1>備份 / 匯出 / 匯入</h1>
+    <div class="card"><h3>📥 從舊系統（凌越等）匯入</h3>
+      <p>在舊系統把<b>產品資料（含庫存）</b>、<b>客戶資料</b>、<b>廠商資料</b>分別匯出成 Excel 或 CSV，再從這裡匯入。
+        系統會自動辨識欄位，先給你預覽，確認沒問題才寫入。</p>
+      <p class="muted">支援 .xlsx、.csv（Big5 或 UTF-8 都可以）、.dbf。舊版 .xls 請先用 Excel「另存新檔」成 .xlsx。
+        同料號 / 同名稱的資料會更新，不會重複建立；庫存會直接設成檔案裡的數字。<b>匯入前建議先下載一次備份。</b></p>
+      <div class="toolbar">
+        <select id="imp-target">
+          <option value="items">產品 / 材料（含庫存）</option>
+          <option value="customer">客戶</option>
+          <option value="supplier">供應商</option>
+        </select>
+        <select id="imp-cat" title="分類對不上時用這個">
+          ${CATEGORIES.map((c) => `<option value="${c}">分類對不上時預設：${c}</option>`).join("")}
+        </select>
+        <input type="file" id="imp-file" accept=".xlsx,.csv,.txt,.dbf,.xls">
+      </div>
+      <div id="imp-result"></div>
+    </div>
     <div class="card"><h3>💾 備份資料庫</h3>
       <p>所有資料都在一個檔案裡。建議<b>每天下班前按一次</b>，把檔案存到隨身碟或雲端硬碟。</p>
       <a class="btn" href="/api/backup">下載備份檔</a>
@@ -662,6 +680,78 @@ views.tools = async () => {
     <div class="card"><h3>📊 匯出庫存表（Excel 可開）</h3>
       <p>包含料號、品名、目前庫存、成本與庫存金額，可用來給會計或月底盤點。</p>
       <a class="btn" href="/api/export/stock.csv">下載庫存 CSV</a></div>`;
+
+  const imp = { file: null, data: null, mapping: null, header_row: null };
+  const out = $("#imp-result");
+  const syncCat = () => ($("#imp-cat").hidden = $("#imp-target").value !== "items");
+  syncCat();
+
+  async function preview(commit = false) {
+    if (!imp.data) return;
+    const body = {
+      target: $("#imp-target").value, filename: imp.file.name, data: imp.data,
+      mapping: imp.mapping, header_row: imp.header_row, default_category: $("#imp-cat").value, commit,
+    };
+    out.innerHTML = '<p class="muted">處理中…</p>';
+    let r;
+    try {
+      r = await api("POST", "/api/import", body);
+    } catch (e) {
+      out.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+      return;
+    }
+    if (r.summary) {
+      const s = r.summary;
+      out.innerHTML = `<p class="tag ok" style="font-size:15px;padding:6px 12px">✅ 匯入完成：新增 ${s.created} 筆、更新 ${s.updated} 筆
+        ${s.stock_set !== undefined ? `、設定庫存 ${s.stock_set} 筆` : ""}</p>`;
+      imp.data = null;
+      $("#imp-file").value = "";
+      toast("匯入完成");
+      return;
+    }
+    imp.mapping = r.mapping;
+    imp.header_row = r.header_row;
+    const colOpts = (sel) => `<option value="">（不匯入）</option>` + r.headers.map((h, i) =>
+      `<option value="${i}" ${sel === i ? "selected" : ""}>${esc(h || "第 " + (i + 1) + " 欄")}</option>`).join("");
+    out.innerHTML = `
+      <h3 style="margin-top:12px">① 確認欄位對應</h3>
+      <p class="muted" style="margin-top:0">左邊是本系統的欄位，右邊選舊檔案裡對應的欄位。表頭在檔案第
+        <input id="imp-hdr" type="number" min="1" value="${r.header_row + 1}" style="width:70px"> 列。</p>
+      <div class="fields">${r.fields.map((f) => `<label>${esc(f.label)}
+        <select data-map="${f.key}">${colOpts(r.mapping[f.key])}</select></label>`).join("")}</div>
+      <h3 style="margin-top:16px">② 預覽（共 ${r.count} 筆，顯示前 ${r.sample.length} 筆）</h3>
+      ${table(r.fields.map((f) => f.label.replace(" *", "")), r.sample.map((rec) =>
+        `<tr>${r.fields.map((f) => `<td>${esc(rec[f.key] ?? "")}</td>`).join("")}</tr>`), "對應後沒有資料，請檢查欄位或表頭列")}
+      ${r.problem_count ? `<details style="margin-top:8px"><summary class="muted">${r.problem_count} 列有問題（點開看）</summary>
+        <ul>${r.problems.map((p) => `<li>${esc(p)}</li>`).join("")}</ul></details>` : ""}
+      <div class="actions" style="justify-content:flex-start">
+        <button type="button" id="imp-go" ${r.missing_required.length || !r.count ? "disabled" : ""}>③ 確認匯入 ${r.count} 筆</button>
+        ${r.missing_required.length ? '<span class="error" style="align-self:center">標 * 的欄位一定要選</span>' : ""}
+      </div>`;
+    $$("[data-map]", out).forEach((sel) => (sel.onchange = () => {
+      imp.mapping[sel.dataset.map] = sel.value === "" ? null : Number(sel.value);
+      preview();
+    }));
+    $("#imp-hdr").onchange = (e) => { imp.header_row = Math.max(Number(e.target.value) - 1, 0); imp.mapping = null; preview(); };
+    $("#imp-go").onclick = () => {
+      if (confirm(`確定匯入 ${r.count} 筆？`)) preview(true);
+    };
+  }
+
+  $("#imp-file").onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      imp.file = file;
+      imp.data = reader.result.split(",")[1];
+      imp.mapping = null;
+      imp.header_row = null;
+      preview();
+    };
+    reader.readAsDataURL(file);
+  };
+  $("#imp-target").onchange = () => { syncCat(); imp.mapping = null; imp.header_row = null; preview(); };
 };
 
 render();
