@@ -57,6 +57,25 @@ def load_demo(path=None):
             server.create_work_order(conn, dict(item_id=ids["FG-FLANGE-002"], qty=10, sales_order_id=so2["id"],
                                                 machine="CNC-05 綜合加工機", due_date=d(1), materials=[
                                                     dict(item_id=ids["RM-SUS304-PL10"], qty_per_unit=1)]))
+            # 模擬從舊系統匯入的過去三年銷貨 / 進貨紀錄
+            import importer
+            hist = []
+            for i, (days, no, cust, code, name, qty, price) in enumerate([
+                (-980, "S1120215001", "永豐機械股份有限公司", "FG-SHAFT-001", "傳動軸", 300, 350),
+                (-700, "S1121120004", "永豐機械股份有限公司", "FG-SHAFT-001", "傳動軸", 200, 360),
+                (-700, "S1121120004", "永豐機械股份有限公司", "SL-010", "軸套（已停產）", 200, 45),
+                (-420, "S1130826002", "永豐機械股份有限公司", "FG-SHAFT-001", "傳動軸", 500, 365),
+                (-150, "S1140512001", "永豐機械股份有限公司", "FG-SHAFT-001", "傳動軸", 300, 375),
+                (-600, "S1130301003", "台中自動化設備", "FG-FLANGE-002", "法蘭盤", 20, 1600),
+                (-90, "S1140710002", "台中自動化設備", "FG-FLANGE-002", "法蘭盤", 15, 1650),
+                (-800, "S1120620001", "宏達精密（已無往來）", "FG-PIN-007", "定位銷", 2000, 12),
+            ]):
+                hist.append(dict(doc_date=d(days), doc_no=no, partner=cust, item_code=code, item_name=name,
+                                 qty=qty, unit_price=price, amount=qty * price))
+            importer.apply_history(conn, hist, "sales")
+            importer.apply_history(conn, [dict(doc_date=d(-200), doc_no="P1140320001", partner="大成金屬材料行",
+                                               item_code="RM-AL6061-D30", item_name="鋁棒 6061", qty=50,
+                                               unit_price=820, amount=41000)], "purchase")
         return True
     finally:
         conn.close()

@@ -103,11 +103,12 @@ function go(view) {
   location.hash = view;
 }
 async function render() {
-  const view = location.hash.slice(1) || "dashboard";
-  $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === view));
+  const [view, arg] = decodeURIComponent(location.hash.slice(1) || "dashboard").split(":");
+  const navView = view === "partner" ? "partners" : view;
+  $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === navView));
   app.innerHTML = '<p class="muted">載入中…</p>';
   try {
-    await (views[view] || views.dashboard)();
+    await (views[view] || views.dashboard)(arg);
   } catch (err) {
     app.innerHTML = `<div class="card error">${esc(err.message)}</div>`;
   }
@@ -256,7 +257,8 @@ views.partners = async () => {
   const list = await api("GET", "/api/partners");
   const section = (type, title) => `<div class="card"><h3>${title}</h3>${table(
     ["名稱", "聯絡人", "電話", "統編", ""],
-    list.filter((p) => p.type === type).map((p) => `<tr><td>${esc(p.name)}</td><td>${esc(p.contact)}</td>
+    list.filter((p) => p.type === type).map((p) => `<tr class="clickable" data-partner="${p.id}">
+      <td>${esc(p.name)}</td><td>${esc(p.contact)}</td>
       <td>${esc(p.phone)}</td><td>${esc(p.tax_id)}</td>
       <td><button class="small ghost" data-edit="${p.id}">編輯</button></td></tr>`))}</div>`;
   app.innerHTML = `
@@ -266,7 +268,95 @@ views.partners = async () => {
   $("#add-c").onclick = () => partnerForm({ type: "customer" });
   $("#add-s").onclick = () => partnerForm({ type: "supplier" });
   const byId = Object.fromEntries(list.map((p) => [p.id, p]));
-  $$("[data-edit]").forEach((b) => (b.onclick = () => partnerForm(byId[b.dataset.edit])));
+  $$("[data-edit]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); partnerForm(byId[b.dataset.edit]); }));
+  $$("[data-partner]").forEach((tr) => (tr.onclick = () => go("partner:" + tr.dataset.partner)));
+};
+
+// 單一客戶 / 廠商：基本資料 + 所有往來紀錄（舊系統 + 本系統）
+views.partner = async (id) => {
+  const { partner: p, stats, history } = await api("GET", `/api/partners/${id}/summary`);
+  const isCus = p.type === "customer";
+  app.innerHTML = `
+    <h1><a class="muted" style="cursor:pointer" id="back">客戶/廠商</a> › ${esc(p.name)}
+      <span class="spacer"></span><button class="ghost" id="edit">編輯資料</button>
+      ${isCus ? '<button id="new-order">＋ 開新訂單</button>' : '<button id="new-order">＋ 開採購單</button>'}</h1>
+    <div class="card"><div class="detail-head">
+      <div><span>聯絡人</span>${esc(p.contact || "—")}</div><div><span>電話</span>${esc(p.phone || "—")}</div>
+      <div><span>統編</span>${esc(p.tax_id || "—")}</div><div><span>地址</span>${esc(p.address || "—")}</div>
+      ${p.note ? `<div style="grid-column:1/-1"><span>備註</span>${esc(p.note)}</div>` : ""}</div></div>
+    <div class="kpis">
+      <div class="kpi"><div class="label">往來期間</div><div class="value" style="font-size:18px">
+        ${stats.first_date ? `${esc(stats.first_date)}<br>～ ${esc(stats.last_date)}` : "尚無紀錄"}</div></div>
+      <div class="kpi"><div class="label">累計${isCus ? "銷貨" : "進貨"}金額</div><div class="value">${money(stats.amount)}</div></div>
+      <div class="kpi"><div class="label">單據數</div><div class="value">${n(stats.docs)}</div></div>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>${isCus ? "常訂" : "常買"}品項</h3>${table(
+        ["料號", "品名", ["次數", "num"], ["累計數量", "num"], ["最近單價", "num"], "最近日期"],
+        stats.top_items.map((t) => `<tr class="clickable" data-search="${esc(t.item_code || t.item_name)}">
+          <td>${esc(t.item_code)}</td><td>${esc(t.item_name)}</td><td class="num">${n(t.times)}</td>
+          <td class="num">${n(t.qty)}</td><td class="num">${t.last_price == null ? "" : n(t.last_price)}</td>
+          <td>${esc(t.last_date)}</td></tr>`), "還沒有交易紀錄")}</div>
+      <div class="card"><h3>每年金額</h3>${table(["年度", ["單據數", "num"], ["金額", "num"]],
+        stats.by_year.map((y) => `<tr><td>${esc(y.year)}</td><td class="num">${n(y.docs)}</td>
+          <td class="num">${money(y.amount)}</td></tr>`), "還沒有交易紀錄")}</div>
+    </div>
+    <div class="card"><h3>全部往來明細 <span class="muted" style="font-weight:400">（最近 ${history.rows.length} 筆，共 ${n(history.count)} 筆）</span></h3>
+      ${historyTable(history.rows, false)}</div>`;
+  $("#back").onclick = () => go("partners");
+  $("#edit").onclick = () => partnerForm(p);
+  $("#new-order").onclick = () => orderForm(isCus ? "sales" : "purchase", null, p.id);
+  $$("[data-search]").forEach((tr) => (tr.onclick = () => {
+    views.history.state = { search: tr.dataset.search, kind: "", date_from: "", date_to: "" };
+    go("history");
+  }));
+  wireHistoryLinks();
+};
+
+function historyTable(list, showPartner = true) {
+  return table(
+    ["日期", "單號", ...(showPartner ? ["客戶 / 廠商"] : []), "料號", "品名", "規格", ["數量", "num"], ["單價", "num"], ["金額", "num"], "來源"],
+    list.map((h) => `<tr class="${h.order_id ? "clickable" : ""}" ${h.order_id ? `data-order="${h.order_id}"` : ""}>
+      <td>${esc(h.doc_date)}</td><td>${esc(h.doc_no)}</td>
+      ${showPartner ? `<td>${h.partner_id ? `<a class="plink" data-pid="${h.partner_id}">${esc(h.partner_name)}</a>` : esc(h.partner_name)}</td>` : ""}
+      <td>${esc(h.item_code)}</td><td>${esc(h.item_name)}</td><td>${esc(h.spec)}</td>
+      <td class="num">${h.qty == null ? "" : n(h.qty)}</td><td class="num">${h.unit_price == null ? "" : n(h.unit_price)}</td>
+      <td class="num">${h.amount == null ? "" : money(h.amount)}</td>
+      <td><span class="tag ${h.source === "本系統" ? "ok" : ""}">${esc(h.source)}${h.kind === "purchase" ? "・進貨" : ""}</span></td></tr>`),
+    "沒有符合的紀錄");
+}
+
+function wireHistoryLinks() {
+  $$("[data-order]").forEach((tr) => (tr.onclick = () => showOrder(tr.dataset.order)));
+  $$(".plink").forEach((a) => (a.onclick = (e) => { e.stopPropagation(); go("partner:" + a.dataset.pid); }));
+}
+
+// 歷史查詢：某個零件以前賣給誰、多少錢；某個客戶以前買過什麼
+views.history = async () => {
+  const state = views.history.state || (views.history.state = { search: "", kind: "", date_from: "", date_to: "" });
+  const h = await api("GET", "/api/history?" + new URLSearchParams(state));
+  app.innerHTML = `
+    <h1>交易歷史查詢</h1>
+    <div class="toolbar">
+      <input id="h-search" placeholder="客戶、料號、品名、規格、單號（空白分隔可多條件）" value="${esc(state.search)}" style="flex:1;min-width:240px">
+      <select id="h-kind">${[["", "銷貨＋進貨"], ["sales", "只看銷貨"], ["purchase", "只看進貨"]].map(([v, t]) =>
+        `<option value="${v}" ${v === state.kind ? "selected" : ""}>${t}</option>`).join("")}</select>
+      <input id="h-from" type="date" value="${esc(state.date_from)}" title="起日">
+      <input id="h-to" type="date" value="${esc(state.date_to)}" title="迄日">
+    </div>
+    <p class="muted">共 ${n(h.count)} 筆，金額合計 ${money(h.amount)}${h.count > h.rows.length ? `（顯示最近 ${h.rows.length} 筆）` : ""}。
+      包含舊系統匯入的紀錄與本系統的訂單。</p>
+    <div class="card">${historyTable(h.rows)}</div>`;
+  let timer;
+  $("#h-search").oninput = (e) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { state.search = e.target.value; refresh(); }, 350);
+  };
+  if (state.search) { $("#h-search").focus(); $("#h-search").setSelectionRange(state.search.length, state.search.length); }
+  $("#h-kind").onchange = (e) => { state.kind = e.target.value; refresh(); };
+  $("#h-from").onchange = (e) => { state.date_from = e.target.value; refresh(); };
+  $("#h-to").onchange = (e) => { state.date_to = e.target.value; refresh(); };
+  wireHistoryLinks();
 };
 
 function partnerForm(p) {
@@ -328,17 +418,17 @@ function orderListView(kind) {
 views.sales = orderListView("sales");
 views.purchase = orderListView("purchase");
 
-async function orderForm(kind, order) {
+async function orderForm(kind, order, presetPartner) {
   const k = KIND[kind];
   const [partners, items] = await Promise.all([
     api("GET", "/api/partners?type=" + k.ptype), api("GET", "/api/items")]);
   if (!partners.length) return alert(`請先到「客戶/廠商」新增${k.partner}`);
   if (!items.length) return alert("請先到「庫存品項」新增品項");
-  const o = order || { order_date: today(), lines: [{}] };
+  const o = order || { order_date: today(), lines: [{}], partner_id: presetPartner };
   const itemOpts = (sel) => `<option value="">— 選擇品項 —</option>` + items.map((i) =>
     `<option value="${i.id}" ${String(i.id) === String(sel) ? "selected" : ""}>${esc(i.code)} ${esc(i.name)}（庫存 ${n(i.stock)}）</option>`).join("");
   const lineRow = (l = {}) => `<tr>
-      <td style="min-width:220px"><select name="item_id">${itemOpts(l.item_id)}</select></td>
+      <td style="min-width:220px"><select name="item_id">${itemOpts(l.item_id)}</select><div class="hint muted"></div></td>
       <td><input name="qty" type="number" step="any" min="0" value="${l.qty ?? ""}" placeholder="數量"></td>
       <td><input name="unit_price" type="number" step="any" min="0" value="${l.unit_price ?? ""}" placeholder="單價"></td>
       <td class="num sub"></td>
@@ -376,10 +466,21 @@ async function orderForm(kind, order) {
       const wire = () => {
         $$("tr", body).forEach((tr) => {
           $(".rm", tr).onclick = () => { if ($$("tr", body).length > 1) tr.remove(); recalc(); };
-          $("[name=item_id]", tr).onchange = (e) => {
+          $("[name=item_id]", tr).onchange = async (e) => {
             const it = byId[e.target.value];
             const price = $("[name=unit_price]", tr);
-            if (it && !price.value) price.value = kind === "sales" ? it.price : it.cost;
+            const hint = $(".hint", tr);
+            hint.textContent = "";
+            if (!it) return recalc();
+            // 先找這個客戶 / 廠商以前的成交價，沒有才用品項預設價
+            const pid = $("[name=partner_id]").value;
+            let past = [];
+            try { past = await api("GET", `/api/last-prices?kind=${kind}&item_id=${it.id}&partner_id=${pid}`); } catch {}
+            const same = past.find((x) => x.same_partner);
+            if (!price.value) price.value = same ? same.unit_price : (kind === "sales" ? it.price : it.cost);
+            hint.innerHTML = past.slice(0, 3).map((x) =>
+              `${x.same_partner ? "📌 " : ""}${esc(x.doc_date)} ${esc(x.partner_name)} ${n(x.qty)}×<b>${n(x.unit_price)}</b>`).join("<br>")
+              || "沒有過去成交紀錄";
             recalc();
           };
           $$("input", tr).forEach((inp) => (inp.oninput = recalc));
@@ -658,6 +759,8 @@ views.tools = async () => {
     <div class="card"><h3>📥 從舊系統（凌越等）匯入</h3>
       <p>在舊系統把<b>產品資料（含庫存）</b>、<b>客戶資料</b>、<b>廠商資料</b>分別匯出成 Excel 或 CSV，再從這裡匯入。
         系統會自動辨識欄位，先給你預覽，確認沒問題才寫入。</p>
+      <p class="muted"><b>過去的銷貨 / 進貨紀錄</b>：用舊系統的「銷貨明細表」「進貨明細表」，有日期、客戶、品名、數量、單價即可，
+        民國年日期也看得懂。匯入後在客戶頁面和「歷史查詢」都查得到，<b>不會影響目前庫存</b>；同一份檔案重複匯入不會重複。</p>
       <p class="muted">支援 .xlsx、.csv（Big5 或 UTF-8 都可以）、.dbf。舊版 .xls 請先用 Excel「另存新檔」成 .xlsx。
         同料號 / 同名稱的資料會更新，不會重複建立；庫存會直接設成檔案裡的數字。<b>匯入前建議先下載一次備份。</b></p>
       <div class="toolbar">
@@ -665,6 +768,8 @@ views.tools = async () => {
           <option value="items">產品 / 材料（含庫存）</option>
           <option value="customer">客戶</option>
           <option value="supplier">供應商</option>
+          <option value="sales_history">過去的銷貨紀錄（客戶歷史）</option>
+          <option value="purchase_history">過去的進貨紀錄</option>
         </select>
         <select id="imp-cat" title="分類對不上時用這個">
           ${CATEGORIES.map((c) => `<option value="${c}">分類對不上時預設：${c}</option>`).join("")}
@@ -702,8 +807,9 @@ views.tools = async () => {
     }
     if (r.summary) {
       const s = r.summary;
-      out.innerHTML = `<p class="tag ok" style="font-size:15px;padding:6px 12px">✅ 匯入完成：新增 ${s.created} 筆、更新 ${s.updated} 筆
-        ${s.stock_set !== undefined ? `、設定庫存 ${s.stock_set} 筆` : ""}</p>`;
+      out.innerHTML = `<p class="tag ok" style="font-size:15px;padding:6px 12px">✅ 匯入完成：新增 ${s.created} 筆${s.updated !== undefined ? `、更新 ${s.updated} 筆` : ""}
+        ${s.stock_set !== undefined ? `、設定庫存 ${s.stock_set} 筆` : ""}
+        ${s.skipped !== undefined ? `、已存在略過 ${s.skipped} 筆、自動建立客戶/廠商 ${s.new_partners} 家` : ""}</p>`;
       imp.data = null;
       $("#imp-file").value = "";
       toast("匯入完成");

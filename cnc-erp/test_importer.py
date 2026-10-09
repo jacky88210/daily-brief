@@ -172,5 +172,82 @@ class ImportTest(unittest.TestCase):
             server.DB_PATH = old
 
 
+# 舊系統「銷貨明細表」：同一張單只有第一行有單號/日期/客戶，日期是民國年，有小計列
+SALES_ROWS = [
+    ["XX精密工業有限公司  銷貨明細表"],
+    ["日期", "單號", "客戶簡稱", "產品編號", "品名", "數量", "單價", "金額"],
+    ["113/03/05", "S1130305001", "永豐機械", "SH-001", "傳動軸", "200", "360", "72,000"],
+    ["", "", "", "SH-002", "軸套", "200", "45", "9,000"],
+    ["", "", "", "", "小計", "", "", "81,000"],
+    ["1140820", "S1140820003", "永豐機械", "SH-001", "傳動軸", "100", "380", "38,000"],
+    ["2025/12/01", "S1141201001", "新客戶精機", "FL-01", "法蘭盤", "10", "1650", "16,500"],
+    ["114/13/40", "BAD", "永豐機械", "SH-001", "傳動軸", "1", "1", "1"],
+]
+
+
+class HistoryImportTest(ImportTest):
+    def import_sales(self, commit=True, rows=SALES_ROWS):
+        return self.run_import(target="sales_history", filename="sales.csv", data=b64(make_csv(rows)), commit=commit)
+
+    def test_norm_date(self):
+        cases = {"113/03/05": "2024-03-05", "1140820": "2025-08-20", "2025/12/1": "2025-12-01",
+                 "20251201": "2025-12-01", "114.1.9": "2025-01-09", "46000": "2025-12-09",
+                 "2025-12-01 00:00:00": "2025-12-01", "114年1月9日": "2025-01-09", "abc": None, "114/13/40": None}
+        for raw, want in cases.items():
+            self.assertEqual(importer.norm_date(raw), want, raw)
+
+    def test_preview_fills_down_and_skips_subtotals(self):
+        r = self.import_sales(commit=False)
+        self.assertEqual(r["count"], 4)
+        second = r["sample"][1]
+        self.assertEqual((second["doc_date"], second["doc_no"], second["partner"]),
+                         ("2024-03-05", "S1130305001", "永豐機械"))
+        self.assertEqual(r["problem_count"], 1)  # 114/13/40
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM history").fetchone()[0], 0)
+
+    def test_commit_creates_missing_customers_and_is_idempotent(self):
+        server.create_partner(self.conn, dict(type="customer", name="永豐機械"))
+        r = self.import_sales()
+        self.assertEqual(r["summary"], {"created": 4, "skipped": 0, "new_partners": 1})
+        r = self.import_sales()
+        self.assertEqual(r["summary"], {"created": 0, "skipped": 4, "new_partners": 0})
+        p = self.conn.execute("SELECT * FROM partners WHERE name = '新客戶精機'").fetchone()
+        self.assertEqual(p["type"], "customer")
+
+    def test_duplicate_lines_in_same_document_are_kept(self):
+        rows = [SALES_ROWS[1], SALES_ROWS[2], SALES_ROWS[2]]
+        self.assertEqual(self.import_sales(rows=rows)["summary"]["created"], 2)
+
+    def test_history_shows_up_in_customer_summary_and_search(self):
+        self.import_sales()
+        pid = self.conn.execute("SELECT id FROM partners WHERE name = '永豐機械'").fetchone()[0]
+        s = server.partner_summary(self.conn, pid)
+        self.assertEqual(s["stats"]["first_date"], "2024-03-05")
+        self.assertEqual(s["stats"]["last_date"], "2025-08-20")
+        self.assertEqual(s["stats"]["amount"], 72000 + 9000 + 38000)
+        top = s["stats"]["top_items"][0]
+        self.assertEqual((top["item_code"], top["times"], top["last_price"]), ("SH-001", 2, 380))
+        self.assertEqual([y["year"] for y in s["stats"]["by_year"]], ["2025", "2024"])
+        h = server.list_history(self.conn, {"search": "法蘭"})
+        self.assertEqual(h["count"], 1)
+        self.assertEqual(h["rows"][0]["partner_name"], "新客戶精機")
+
+    def test_last_prices_prefers_same_customer_and_includes_new_orders(self):
+        self.import_sales()
+        item = server.create_item(self.conn, dict(code="SH-001", name="傳動軸"))["id"]
+        yf = self.conn.execute("SELECT id FROM partners WHERE name = '永豐機械'").fetchone()[0]
+        other = self.conn.execute("SELECT id FROM partners WHERE name = '新客戶精機'").fetchone()[0]
+        prices = server.last_prices(self.conn, {"item_id": item, "partner_id": yf})
+        self.assertEqual([p["unit_price"] for p in prices], [380, 360])
+        self.assertTrue(prices[0]["same_partner"])
+        server.create_order(self.conn, dict(kind="sales", partner_id=other, order_date="2026-01-05",
+                                            lines=[dict(item_id=item, qty=5, unit_price=400)]))
+        prices = server.last_prices(self.conn, {"item_id": item, "partner_id": other})
+        self.assertEqual((prices[0]["source"], prices[0]["unit_price"], prices[0]["same_partner"]), ("本系統", 400, 1))
+        # 歷史查詢也會看到本系統的新訂單
+        h = server.list_history(self.conn, {"item_code": "SH-001"})
+        self.assertEqual(h["count"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

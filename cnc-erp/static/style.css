@@ -105,3 +105,5 @@ dialog h2 { margin: 0 0 16px; font-size: 20px; }
 }
 [hidden] { display: none !important; }
 .grid td { white-space: nowrap; }
+.hint { font-size: 12px; margin-top: 2px; line-height: 1.4; }
+.plink { color: var(--brand); cursor: pointer; }

@@ -6,10 +6,12 @@
 """
 import base64
 import csv
+import hashlib
 import io
 import re
 import struct
 import zipfile
+from datetime import date, timedelta
 from xml.etree import ElementTree as ET
 
 import server
@@ -40,8 +42,25 @@ FIELDS = {
         ("note", "備註", ["備註", "付款條件", "說明"]),
     ],
 }
-REQUIRED = {"items": ["code", "name"], "partners": ["name"]}
-NUMERIC = {"stock", "safety_stock", "cost", "price"}
+FIELDS["history"] = [
+    ("doc_date", "日期 *", ["日期", "單據日期", "銷貨日期", "出貨日期", "進貨日期", "交易日期", "訂單日期", "開單日期"]),
+    ("doc_no", "單號", ["單號", "單據號碼", "單據編號", "銷貨單號", "出貨單號", "進貨單號", "訂單單號", "訂單編號",
+                       "憑證號碼", "發票號碼"]),
+    ("partner", "客戶 / 廠商 *", ["客戶名稱", "客戶簡稱", "廠商名稱", "廠商簡稱", "客戶", "廠商", "供應商", "交易對象", "名稱"]),
+    ("item_code", "料號", ["產品編號", "料號", "品號", "產品代號", "商品編號", "貨號", "料品編號"]),
+    ("item_name", "品名", ["品名", "產品名稱", "商品名稱", "品名規格"]),
+    ("spec", "規格", ["規格", "規格說明", "型號"]),
+    ("unit", "單位", ["單位"]),
+    ("qty", "數量", ["數量", "銷貨數量", "出貨數量", "進貨數量", "交易數量"]),
+    ("unit_price", "單價", ["單價", "銷貨單價", "進貨單價", "售價", "進價"]),
+    ("amount", "金額", ["金額", "小計", "未稅金額", "銷貨金額", "進貨金額", "合計金額"]),
+    ("note", "備註", ["備註", "說明", "摘要"]),
+]
+REQUIRED = {"items": ["code", "name"], "partners": ["name"], "history": ["doc_date", "partner"]}
+NUMERIC = {"stock", "safety_stock", "cost", "price", "qty", "unit_price", "amount"}
+TOTAL_ROW = re.compile(r"(本頁|本單|單據|客戶|廠商|總)?(合計|總計|小計)(金額)?")
+# 報表常見「同一張單只在第一行印單號、日期、客戶」，下面幾行留白 → 往下沿用
+FILL_DOWN = {"history": ["doc_date", "doc_no", "partner"]}
 CATEGORIES = ["原料", "成品", "半成品", "刀具", "耗材", "其他"]
 
 
@@ -184,8 +203,37 @@ def _num(v):
         return None
 
 
+def norm_date(v):
+    """把各種日期寫法轉成 2026-10-09。支援民國年（115/10/09、1151009、115.10.09）、
+    西元年（2026/10/9、20261009）與 Excel 的日期序號。無法辨識回傳 None。"""
+    s = str(v or "").strip()
+    if not s:
+        return None
+    s = s.split(" ")[0].split("T")[0]
+    try:
+        if re.fullmatch(r"\d{5}(\.0+)?", s):  # Excel 日期序號
+            n = int(float(s))
+            if 20000 <= n <= 80000:
+                return (date(1899, 12, 30) + timedelta(days=n)).isoformat()
+        if re.fullmatch(r"\d{8}", s):
+            return date(int(s[:4]), int(s[4:6]), int(s[6:])).isoformat()
+        if re.fullmatch(r"\d{6,7}", s):  # 民國 yyyMMdd / yyMMdd
+            return date(int(s[:-4]) + 1911, int(s[-4:-2]), int(s[-2:])).isoformat()
+        parts = re.split(r"[/\-.年月日]", s)
+        parts = [x for x in parts if x]
+        if len(parts) == 3 and all(x.isdigit() for x in parts):
+            y, m, d = (int(x) for x in parts)
+            if y < 1000:
+                y += 1911
+            return date(y, m, d).isoformat()
+    except ValueError:
+        return None
+    return None
+
+
 def map_rows(rows, header_idx, mapping, kind):
     records, problems = [], []
+    carry = {}
     for line_no, r in enumerate(rows[header_idx + 1:], start=header_idx + 2):
         rec = {}
         for field, col in mapping.items():
@@ -195,11 +243,25 @@ def map_rows(rows, header_idx, mapping, kind):
             rec[field] = str(r[col]).strip() if col < len(r) else ""
         if not any(rec.values()):
             continue
+        if any(TOTAL_ROW.fullmatch(_norm(c)) for c in r) and not (rec.get("item_code") or rec.get("code")):
+            continue  # 報表的合計 / 小計列
+        for f in FILL_DOWN.get(kind, []):
+            if f in mapping and mapping[f] is not None:
+                if rec.get(f):
+                    carry[f] = rec[f]
+                else:
+                    rec[f] = carry.get(f, "")
+        if kind == "history":
+            if not (rec.get("item_code") or rec.get("item_name")):
+                continue  # 只有表頭沒有品項的列（例如單據抬頭）
+            d = norm_date(rec.get("doc_date"))
+            if rec.get("doc_date") and not d:
+                problems.append(f"第 {line_no} 列日期「{rec['doc_date']}」看不懂，已略過")
+                continue
+            rec["doc_date"] = d or ""
         missing = [f for f in REQUIRED[kind] if not rec.get(f)]
         if missing:
-            # 報表最後常有「合計」列，直接略過不算錯誤
-            if not any("合計" in str(c) or "總計" in str(c) for c in r):
-                problems.append(f"第 {line_no} 列缺少必填欄位，已略過")
+            problems.append(f"第 {line_no} 列缺少必填欄位，已略過")
             continue
         for f in NUMERIC & rec.keys():
             n = _num(rec[f])
@@ -270,13 +332,46 @@ def apply_partners(conn, records, ptype):
     return {"created": created, "updated": updated}
 
 
+def apply_history(conn, records, kind):
+    """匯入歷史交易。同一個檔案重複匯入不會重複（用內容做指紋）。
+    客戶 / 廠商名稱在本系統找不到時自動建立，避免舊客戶遺失。"""
+    ptype = "customer" if kind == "sales" else "supplier"
+    partners = {r["name"]: r["id"] for r in conn.execute(
+        "SELECT id, name FROM partners WHERE type = ?", (ptype,))}
+    created = skipped = new_partners = 0
+    seen = {}
+    for rec in records:
+        name = rec["partner"]
+        if name not in partners:
+            partners[name] = server.create_partner(conn, {
+                "type": ptype, "name": name, "note": "由舊系統交易紀錄自動建立"})["id"]
+            new_partners += 1
+        key = "|".join(str(rec.get(f) if rec.get(f) is not None else "") for f in
+                       ("doc_date", "doc_no", "partner", "item_code", "item_name", "spec", "qty", "unit_price", "amount"))
+        seen[key] = seen.get(key, 0) + 1  # 同一張單同品項同數量出現兩次也要保留
+        fp = hashlib.sha1(f"{kind}|{key}|{seen[key]}".encode()).hexdigest()
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO history (kind, doc_date, doc_no, partner_id, partner_name, item_code, item_name,
+                   spec, unit, qty, unit_price, amount, note, fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (kind, rec["doc_date"], rec.get("doc_no", ""), partners[name], name, rec.get("item_code", ""),
+             rec.get("item_name", ""), rec.get("spec", ""), rec.get("unit", ""), rec.get("qty"),
+             rec.get("unit_price"), rec.get("amount"), rec.get("note", ""), fp))
+        if cur.rowcount:
+            created += 1
+        else:
+            skipped += 1
+    return {"created": created, "skipped": skipped, "new_partners": new_partners}
+
+
 def run_import(conn, body):
-    """body: target (items/customer/supplier), filename, data (base64), mapping?, header_row?,
+    """body: target (items/customer/supplier/sales_history/purchase_history), filename, data (base64), mapping?, header_row?,
     default_category?, commit (bool)。"""
     target = body.get("target")
-    if target not in ("items", "customer", "supplier"):
+    kinds = {"items": "items", "customer": "partners", "supplier": "partners",
+             "sales_history": "history", "purchase_history": "history"}
+    if target not in kinds:
         raise server.ApiError("請選擇要匯入的資料類型")
-    kind = "items" if target == "items" else "partners"
+    kind = kinds[target]
     try:
         raw = base64.b64decode(body.get("data") or "")
     except ValueError:
@@ -314,6 +409,8 @@ def run_import(conn, body):
             raise server.ApiError("沒有可以匯入的資料")
         if kind == "items":
             result["summary"] = apply_items(conn, records, body.get("default_category") or "原料")
+        elif kind == "history":
+            result["summary"] = apply_history(conn, records, target.split("_")[0])
         else:
             result["summary"] = apply_partners(conn, records, target)
     return result

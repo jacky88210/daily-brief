@@ -109,6 +109,26 @@ CREATE TABLE IF NOT EXISTS stock_moves (
     move_date TEXT NOT NULL,
     note TEXT DEFAULT ''
 );
+-- 舊系統的歷史交易明細：只做查詢用，不影響庫存
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('purchase', 'sales')),
+    doc_date TEXT DEFAULT '',
+    doc_no TEXT DEFAULT '',
+    partner_id INTEGER REFERENCES partners(id),
+    partner_name TEXT DEFAULT '',
+    item_code TEXT DEFAULT '',
+    item_name TEXT DEFAULT '',
+    spec TEXT DEFAULT '',
+    unit TEXT DEFAULT '',
+    qty REAL,
+    unit_price REAL,
+    amount REAL,
+    note TEXT DEFAULT '',
+    fingerprint TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_history_partner ON history(partner_id);
+CREATE INDEX IF NOT EXISTS idx_history_item ON history(item_code);
 CREATE INDEX IF NOT EXISTS idx_moves_item ON stock_moves(item_id);
 CREATE INDEX IF NOT EXISTS idx_lines_order ON order_lines(order_id);
 """
@@ -533,6 +553,102 @@ def adjust_stock(conn, body):
     return {"ok": True, "diff": diff}
 
 
+# ---------------------------------------------------------------- 交易歷史（舊系統 + 本系統）
+
+# 本系統的訂單明細與舊系統匯入的歷史，整理成同一種格式一起查
+HISTORY_UNION = """
+SELECT '本系統' AS source, o.kind, o.order_date AS doc_date, o.no AS doc_no, o.id AS order_id,
+       o.partner_id, p.name AS partner_name, i.code AS item_code, i.name AS item_name, i.spec, i.unit,
+       l.qty, l.unit_price, l.qty * l.unit_price AS amount, o.note
+FROM order_lines l JOIN orders o ON o.id = l.order_id JOIN partners p ON p.id = o.partner_id
+JOIN items i ON i.id = l.item_id WHERE o.status != 'cancelled'
+UNION ALL
+SELECT '舊系統', kind, doc_date, doc_no, NULL, partner_id, partner_name, item_code, item_name, spec, unit,
+       qty, unit_price, COALESCE(amount, qty * unit_price), note
+FROM history
+"""
+
+
+def _history_filter(conn, q):
+    where, args = [], []
+    if q.get("kind"):
+        where.append("kind = ?")
+        args.append(q["kind"])
+    if q.get("partner_id"):
+        p = conn.execute("SELECT name FROM partners WHERE id = ?", (int(q["partner_id"]),)).fetchone()
+        where.append("(partner_id = ? OR partner_name = ?)")
+        args += [int(q["partner_id"]), p["name"] if p else ""]
+    if q.get("item_code"):
+        where.append("item_code = ?")
+        args.append(q["item_code"])
+    if q.get("search"):
+        for word in q["search"].split():
+            where.append("(partner_name LIKE ? OR item_code LIKE ? OR item_name LIKE ? OR spec LIKE ? "
+                         "OR doc_no LIKE ? OR note LIKE ?)")
+            args += [f"%{word}%"] * 6
+    if q.get("date_from"):
+        where.append("doc_date >= ?")
+        args.append(q["date_from"])
+    if q.get("date_to"):
+        where.append("doc_date <= ?")
+        args.append(q["date_to"])
+    return (" WHERE " + " AND ".join(where)) if where else "", args
+
+
+def list_history(conn, q):
+    where, args = _history_filter(conn, q)
+    limit = min(int(q.get("limit") or 500), 5000)
+    data = rows(conn.execute(
+        f"SELECT * FROM ({HISTORY_UNION}){where} ORDER BY doc_date DESC, doc_no DESC LIMIT ?", args + [limit]))
+    total = conn.execute(f"SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM ({HISTORY_UNION}){where}",
+                         args).fetchone()
+    return {"rows": data, "count": total[0], "amount": total[1]}
+
+
+def partner_summary(conn, pid):
+    p = conn.execute("SELECT * FROM partners WHERE id = ?", (pid,)).fetchone()
+    if not p:
+        raise ApiError("找不到客戶 / 廠商", 404)
+    q = {"partner_id": pid}
+    where, args = _history_filter(conn, q)
+    sub = f"SELECT * FROM ({HISTORY_UNION}){where}"
+    stats = dict(conn.execute(
+        f"""SELECT COUNT(DISTINCT doc_no) AS docs, MIN(NULLIF(doc_date, '')) AS first_date,
+                   MAX(doc_date) AS last_date, COALESCE(SUM(amount), 0) AS amount FROM ({sub})""",
+        args).fetchone())
+    stats["by_year"] = rows(conn.execute(
+        f"""SELECT SUBSTR(doc_date, 1, 4) AS year, COALESCE(SUM(amount), 0) AS amount,
+                   COUNT(DISTINCT doc_no) AS docs FROM ({sub}) WHERE doc_date != ''
+            GROUP BY year ORDER BY year DESC""", args))
+    stats["top_items"] = rows(conn.execute(
+        f"""SELECT item_code, item_name, MAX(spec) AS spec, COUNT(*) AS times, SUM(qty) AS qty,
+                   COALESCE(SUM(amount), 0) AS amount, MAX(doc_date) AS last_date,
+                   (SELECT h2.unit_price FROM ({sub}) h2 WHERE h2.item_code = h.item_code
+                        AND h2.item_name = h.item_name ORDER BY h2.doc_date DESC LIMIT 1) AS last_price
+            FROM ({sub}) h GROUP BY item_code, item_name ORDER BY times DESC, amount DESC LIMIT 15""",
+        args * 2))
+    return {"partner": dict(p), "stats": stats, "history": list_history(conn, dict(q, limit=300))}
+
+
+def last_prices(conn, q):
+    """開單時參考：這個品項之前賣給（或跟誰買）的價格，先列同一個客戶，再列其他人。"""
+    item = conn.execute("SELECT code FROM items WHERE id = ?", (int(q.get("item_id") or 0),)).fetchone()
+    if not item:
+        return []
+    kind = q.get("kind") or "sales"
+    pid = int(q.get("partner_id") or 0)
+    pname = ""
+    if pid:
+        r = conn.execute("SELECT name FROM partners WHERE id = ?", (pid,)).fetchone()
+        pname = r["name"] if r else ""
+    return rows(conn.execute(
+        f"""SELECT source, doc_date, doc_no, partner_name, qty, unit_price,
+                   (partner_id = ? OR partner_name = ?) AS same_partner
+            FROM ({HISTORY_UNION}) WHERE kind = ? AND item_code = ? AND unit_price IS NOT NULL
+            ORDER BY same_partner DESC, doc_date DESC LIMIT 5""",
+        (pid, pname, kind, item["code"])))
+
+
 # ---------------------------------------------------------------- dashboard
 
 def dashboard(conn, q):
@@ -619,6 +735,7 @@ ROUTES = [
     ("DELETE", r"/api/items/(\d+)", lambda c, q, b, i: delete_item(c, int(i))),
     ("GET", r"/api/partners", lambda c, q, b: list_partners(c, q)),
     ("POST", r"/api/partners", lambda c, q, b: create_partner(c, b)),
+    ("GET", r"/api/partners/(\d+)/summary", lambda c, q, b, i: partner_summary(c, int(i))),
     ("PUT", r"/api/partners/(\d+)", lambda c, q, b, i: update_partner(c, int(i), b)),
     ("DELETE", r"/api/partners/(\d+)", lambda c, q, b, i: delete_partner(c, int(i))),
     ("GET", r"/api/orders", lambda c, q, b: list_orders(c, q)),
@@ -636,6 +753,8 @@ ROUTES = [
     ("POST", r"/api/workorders/(\d+)/cancel", lambda c, q, b, i: cancel_work_order(c, int(i))),
     ("GET", r"/api/stock/moves", lambda c, q, b: list_moves(c, q)),
     ("POST", r"/api/stock/adjust", lambda c, q, b: adjust_stock(c, b)),
+    ("GET", r"/api/history", lambda c, q, b: list_history(c, q)),
+    ("GET", r"/api/last-prices", lambda c, q, b: last_prices(c, q)),
     ("POST", r"/api/import", lambda c, q, b: __import__("importer").run_import(c, b)),
 ]
 ROUTES = [(m, re.compile("^" + p + "$"), fn) for m, p, fn in ROUTES]
