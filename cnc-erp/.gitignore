@@ -2,3 +2,10 @@ cnc.db
 cnc.db-journal
 __pycache__/
 demo.db
+# 舊系統備份檔含客戶資料，不要放進版本控制
+*.001
+*.00[2-9]
+*BKUP*
+*.bak
+*.dbf
+*.DBF
