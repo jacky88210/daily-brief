@@ -1,0 +1,4 @@
+cnc.db
+cnc.db-journal
+__pycache__/
+demo.db

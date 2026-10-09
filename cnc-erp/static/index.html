@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CNC 進銷存</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E⚙️%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">CNC 進銷存</div>
+  <nav id="nav">
+    <a data-view="dashboard">總覽</a>
+    <a data-view="sales">銷貨訂單</a>
+    <a data-view="workorders">生產工單</a>
+    <a data-view="purchase">採購進貨</a>
+    <a data-view="items">庫存品項</a>
+    <a data-view="moves">庫存異動</a>
+    <a data-view="partners">客戶/廠商</a>
+    <a data-view="tools">備份匯出</a>
+  </nav>
+</header>
+<main id="app"></main>
+
+<dialog id="modal">
+  <form method="dialog" id="modal-form">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <p class="error" id="modal-error"></p>
+    <div class="actions">
+      <button type="button" class="ghost" id="modal-cancel">取消</button>
+      <button type="submit" id="modal-ok">儲存</button>
+    </div>
+  </form>
+</dialog>
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>
