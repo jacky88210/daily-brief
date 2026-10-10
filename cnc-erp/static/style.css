@@ -107,3 +107,5 @@ dialog h2 { margin: 0 0 16px; font-size: 20px; }
 .grid td { white-space: nowrap; }
 .hint { font-size: 12px; margin-top: 2px; line-height: 1.4; }
 .plink { color: var(--brand); cursor: pointer; }
+.toolbar label { display: inline-flex; align-items: center; gap: 6px; }
+.toolbar input[type="checkbox"] { min-width: 0; width: auto; }

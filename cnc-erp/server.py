@@ -725,6 +725,31 @@ def backup_bytes():
         os.remove(tmp)
 
 
+# ---------------------------------------------------------------- 凌越備份匯入
+
+def lingyue_upload_path():
+    return os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "lingyue_upload.001")
+
+
+def _lingyue_raw(body):
+    path = (body.get("path") or "").strip().strip('"')
+    target = path or lingyue_upload_path()
+    if not os.path.isfile(target):
+        raise ApiError(f"找不到檔案：{path}" if path else "請先選擇凌越的備份檔")
+    with open(target, "rb") as f:
+        return f.read()
+
+
+def lingyue_preview(conn, body):
+    import lingyue
+    return lingyue.preview(_lingyue_raw(body), body.get("prefix"))
+
+
+def lingyue_import(conn, body):
+    import lingyue
+    return lingyue.run(conn, _lingyue_raw(body), body)
+
+
 # ---------------------------------------------------------------- routing
 
 ROUTES = [
@@ -755,6 +780,8 @@ ROUTES = [
     ("POST", r"/api/stock/adjust", lambda c, q, b: adjust_stock(c, b)),
     ("GET", r"/api/history", lambda c, q, b: list_history(c, q)),
     ("GET", r"/api/last-prices", lambda c, q, b: last_prices(c, q)),
+    ("POST", r"/api/lingyue/preview", lambda c, q, b: lingyue_preview(c, b)),
+    ("POST", r"/api/lingyue/import", lambda c, q, b: lingyue_import(c, b)),
     ("POST", r"/api/import", lambda c, q, b: __import__("importer").run_import(c, b)),
 ]
 ROUTES = [(m, re.compile("^" + p + "$"), fn) for m, p, fn in ROUTES]
@@ -811,6 +838,27 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/backup":
             return self._send(200, backup_bytes(), "application/octet-stream", {
                 "Content-Disposition": f'attachment; filename="cnc-backup-{today()}.db"'})
+        if url.path == "/api/lingyue/upload" and method == "POST":
+            # 備份檔可能有幾十 MB，直接收原始檔案存起來，再回傳預覽
+            length = int(self.headers.get("Content-Length") or 0)
+            if not length:
+                return self._send(400, {"error": "請選擇檔案"})
+            tmp = lingyue_upload_path() + ".part"
+            with open(tmp, "wb") as f:
+                left = length
+                while left:
+                    chunk = self.rfile.read(min(left, 1 << 20))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    left -= len(chunk)
+            os.replace(tmp, lingyue_upload_path())
+            try:
+                status, payload = handle_api("POST", "/api/lingyue/preview", query, {"prefix": query.get("prefix")})
+            except Exception as e:
+                self.log_error("internal error: %r", e)
+                status, payload = 500, {"error": "系統錯誤：" + str(e)}
+            return self._send(status, payload)
         if url.path.startswith("/api/"):
             body = {}
             length = int(self.headers.get("Content-Length") or 0)

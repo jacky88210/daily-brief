@@ -753,10 +753,140 @@ views.moves = async () => {
 
 // ---------------------------------------------------------------- 備份 / 匯出
 
+// ---------------------------------------------------------------- 凌越備份轉入
+
+const LY_KINDS = [["sales", "銷貨"], ["sales_return", "銷貨退回"], ["purchase", "進貨"],
+  ["purchase_return", "進貨退出"], ["skip", "不匯入"]];
+
+function wireLingyue() {
+  const out = $("#ly-result");
+  let source = {};
+  let preview = null;
+
+  async function load(promise) {
+    out.innerHTML = '<p class="muted">讀取中…檔案較大時約需數十秒</p>';
+    try {
+      preview = await promise;
+      renderPreview();
+    } catch (e) {
+      out.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+    }
+  }
+
+  $("#ly-file").onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    source = {};
+    $("#ly-path").value = "";
+    load(fetch("/api/lingyue/upload", { method: "POST", body: file }).then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "讀取失敗");
+      return data;
+    }));
+  };
+  $("#ly-read").onclick = () => {
+    const path = $("#ly-path").value.trim();
+    if (!path) return ($("#ly-path").focus());
+    source = { path };
+    load(api("POST", "/api/lingyue/preview", source));
+  };
+
+  function renderPreview() {
+    const p = preview;
+    const t = (k) => (p.tables.find((x) => x.name === k) || {}).records ?? 0;
+    const kindSel = (ty) => `<select data-type="${esc(ty.key)}">${LY_KINDS.map(([v, l]) =>
+      `<option value="${v}" ${v === ty.guess ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+    const clsSel = (c) => `<select data-class="${esc(c.class)}">${[["customer", "客戶"], ["supplier", "供應商"], ["skip", "不匯入"]].map(([v, l]) =>
+      `<option value="${v}" ${v === c.guess ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+    out.innerHTML = `
+      <p class="tag ok" style="font-size:15px;padding:6px 12px">✅ 讀到凌越資料${p.company ? "：" + esc(p.company) : ""}</p>
+      <div class="kpis" style="margin-top:12px">
+        <div class="kpi"><div class="label">客戶 / 廠商</div><div class="value">${n(p.partners)}</div></div>
+        <div class="kpi"><div class="label">產品 / 材料</div><div class="value">${n(p.items.count)}</div></div>
+        <div class="kpi"><div class="label">過去單據</div><div class="value">${n(t("SLIP"))}</div></div>
+        <div class="kpi"><div class="label">單據明細</div><div class="value">${n(t("SLIPDT"))}</div></div>
+      </div>
+      ${p.prefixes.length > 1 ? `<p>這個備份有多組資料：<select id="ly-prefix">${p.prefixes.map((x) =>
+        `<option ${x === p.prefix ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></p>` : ""}
+
+      <h3>① 單據種類是什麼？</h3>
+      <p class="muted" style="margin-top:0">凌越用代碼區分單據。系統依「往來對象」和「售價 / 成本」先猜好了，
+        <b>請看看最常往來的對象對不對</b>，不對就改。不確定的種類（例如報價單、調撥單）選「不匯入」。</p>
+      ${table(["凌越代碼", "這是", ["單據數", "num"], ["明細", "num"], "期間", ["金額", "num"], "最常往來"],
+        p.types.map((ty) => `<tr><td><code>${esc(ty.class)} / ${esc(ty.slip_fg)}</code></td><td>${kindSel(ty)}</td>
+          <td class="num">${n(ty.docs)}</td><td class="num">${n(ty.lines)}</td>
+          <td>${esc(ty.date_from)} ～ ${esc(ty.date_to)}</td><td class="num">${money(ty.amount)}</td>
+          <td style="white-space:normal">${ty.top_partners.map(esc).join("、")}</td></tr>`), "備份裡沒有單據")}
+
+      <h3 style="margin-top:16px">② 客戶還是廠商？</h3>
+      ${table(["凌越代碼", "這是", ["筆數", "num"], "例如"], p.partner_classes.map((c) => `<tr>
+        <td><code>${esc(c.class || "（空白）")}</code></td><td>${clsSel(c)}</td><td class="num">${n(c.count)}</td>
+        <td style="white-space:normal">${c.samples.map(esc).join("、")}</td></tr>`))}
+
+      <h3 style="margin-top:16px">③ 要轉哪些資料</h3>
+      <div class="toolbar">
+        <label><input type="checkbox" id="ly-partners" checked style="width:auto"> 客戶 / 廠商</label>
+        <label><input type="checkbox" id="ly-items" checked style="width:auto"> 產品、材料與目前庫存（${n(p.items.with_stock)} 項有庫存）</label>
+        <label><input type="checkbox" id="ly-history" checked style="width:auto"> 過去的進銷貨紀錄</label>
+      </div>
+      <p class="muted">產品分類：賣過的 → 成品、只買過的 → 原料、其他 →
+        <select id="ly-cat" style="width:auto">${CATEGORIES.map((c) => `<option ${c === "其他" ? "selected" : ""}>${c}</option>`).join("")}</select>
+        （之後都可以再改）。庫存會設成凌越備份當時的數量。</p>
+      ${p.open_orders.length ? `<details><summary>凌越裡還有 ${p.open_orders.length} 張未結訂單（請在新系統重開）</summary>
+        ${table(["單號", "對象", "日期", "交期", "品項"], p.open_orders.map((o) => `<tr><td>${esc(o.no)}</td>
+          <td>${esc(o.partner)}</td><td>${esc(o.date)}</td><td>${esc(o.due)}</td>
+          <td style="white-space:normal">${o.lines.map((l) => `${esc(l.code)} ${esc(l.name)} ${n(l.qty)}（已交 ${n(l.delivered)}）× ${n(l.price)}`).join("<br>")}</td></tr>`))}
+        </details>` : ""}
+      <div class="actions" style="justify-content:flex-start">
+        <button type="button" id="ly-go">④ 開始轉入</button>
+        <span class="muted" style="align-self:center">轉入前建議先按下方「下載備份檔」</span>
+      </div>`;
+    if ($("#ly-prefix")) $("#ly-prefix").onchange = (e) =>
+      load(api("POST", "/api/lingyue/preview", { ...source, prefix: e.target.value }));
+    $("#ly-go").onclick = async () => {
+      const type_map = Object.fromEntries($$("[data-type]", out).map((s) => [s.dataset.type, s.value]));
+      const partner_map = Object.fromEntries($$("[data-class]", out).map((s) => [s.dataset.class, s.value]));
+      const parts = { partners: $("#ly-partners").checked, items: $("#ly-items").checked, history: $("#ly-history").checked };
+      const chosen = p.types.filter((ty) => type_map[ty.key] !== "skip").map((ty) =>
+        `${ty.class}/${ty.slip_fg} → ${LY_KINDS.find((k) => k[0] === type_map[ty.key])[1]}`);
+      if (!confirm(`確定轉入？\n\n${chosen.join("\n") || "（不匯入任何單據）"}`)) return;
+      $("#ly-go").disabled = true;
+      $("#ly-go").textContent = "轉入中，請稍候…";
+      try {
+        const r = await api("POST", "/api/lingyue/import", { ...source, prefix: p.prefix, type_map, partner_map, parts,
+          default_category: $("#ly-cat").value });
+        const pt = r.partners || {}, it = r.items, h = r.history || {};
+        const sum = (o, k) => Object.values(o).reduce((a, x) => a + (x[k] || 0), 0);
+        out.innerHTML = `<div class="card" style="background:var(--ok-bg)"><h3>✅ 轉入完成</h3><ul>
+          ${r.partners ? `<li>客戶 / 廠商：新增 ${sum(pt, "created")}、更新 ${sum(pt, "updated")}</li>` : ""}
+          ${it ? `<li>產品 / 材料：新增 ${n(it.created)}、更新 ${n(it.updated)}，設定庫存 ${n(it.stock_set)} 項</li>` : ""}
+          ${r.history ? `<li>交易紀錄：新增 ${n(sum(h, "created"))} 筆${sum(h, "skipped") ? `（${n(sum(h, "skipped"))} 筆之前已轉過，略過）` : ""}</li>` : ""}
+          </ul><p>可以到「客戶/廠商」點進任一家客戶，或用「歷史查詢」查看以前的紀錄。</p></div>`;
+        toast("轉入完成");
+      } catch (e) {
+        $("#ly-go").disabled = false;
+        $("#ly-go").textContent = "④ 開始轉入";
+        out.insertAdjacentHTML("beforeend", `<p class="error">${esc(e.message)}（資料沒有寫入任何一筆，可以修正後再試）</p>`);
+      }
+    };
+  }
+}
+
 views.tools = async () => {
   app.innerHTML = `
     <h1>備份 / 匯出 / 匯入</h1>
-    <div class="card"><h3>📥 從舊系統（凌越等）匯入</h3>
+    <div class="card" id="ly-card"><h3>⭐ 從凌越備份檔一次轉入（建議）</h3>
+      <p>在凌越做一次「備份」，會產生 <code>wstkBKUP.001</code> 這種檔案。把它交給系統，
+        <b>客戶、廠商、產品、目前庫存、所有過去的進銷貨紀錄</b>一次轉進來。先預覽、確認後才寫入；重複轉入不會重複。</p>
+      <div class="toolbar">
+        <input type="file" id="ly-file" accept=".001,.002,.bak,*">
+        <span class="muted" style="align-self:center">或輸入檔案位置：</span>
+        <input id="ly-path" placeholder="" style="flex:1;min-width:260px">
+        <button type="button" class="ghost" id="ly-read">讀取</button>
+      </div>
+      <div id="ly-result"></div>
+    </div>
+    <div class="card"><h3>📥 從 Excel / CSV 匯入</h3>
       <p>在舊系統把<b>產品資料（含庫存）</b>、<b>客戶資料</b>、<b>廠商資料</b>分別匯出成 Excel 或 CSV，再從這裡匯入。
         系統會自動辨識欄位，先給你預覽，確認沒問題才寫入。</p>
       <p class="muted"><b>過去的銷貨 / 進貨紀錄</b>：用舊系統的「銷貨明細表」「進貨明細表」，有日期、客戶、品名、數量、單價即可，
@@ -786,6 +916,8 @@ views.tools = async () => {
       <p>包含料號、品名、目前庫存、成本與庫存金額，可用來給會計或月底盤點。</p>
       <a class="btn" href="/api/export/stock.csv">下載庫存 CSV</a></div>`;
 
+  $("#ly-path").placeholder = "例：\\\\YHH\\homes\\HSU_HOME\\公司\\wstkBKUP.001";
+  wireLingyue();
   const imp = { file: null, data: null, mapping: null, header_row: null };
   const out = $("#imp-result");
   const syncCat = () => ($("#imp-cat").hidden = $("#imp-target").value !== "items");
