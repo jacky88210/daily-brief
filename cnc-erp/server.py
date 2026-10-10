@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CNC 加工廠進銷存系統（輕量版）
 
-只需要 Python 3.9 以上，不用安裝任何套件。
+只需要 Python 3.7 以上，不用安裝任何套件。
 資料存在同資料夾的 cnc.db（SQLite），備份只要複製這個檔案。
 
 啟動：python server.py            → 本機瀏覽器開 http://127.0.0.1:8080
