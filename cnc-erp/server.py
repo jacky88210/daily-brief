@@ -134,8 +134,23 @@ CREATE INDEX IF NOT EXISTS idx_lines_order ON order_lines(order_id);
 """
 
 ITEM_FIELDS = ["code", "name", "category", "spec", "unit", "safety_stock",
-               "cost", "price", "location", "note"]
-PARTNER_FIELDS = ["type", "name", "contact", "phone", "tax_id", "address", "note"]
+               "cost", "price", "location", "note",
+               # CNC 加工用：客戶圖號、版次、材質、表面 / 熱處理、所屬客戶、單件加工時間（分鐘）
+               "drawing_no", "revision", "material", "finish", "customer_id", "cycle_min"]
+PARTNER_FIELDS = ["type", "name", "short_name", "grp", "contact", "phone", "fax", "email", "owner",
+                  "tax_id", "address", "note",
+                  # 經濟部商工登記查到的資料
+                  "reg_status", "reg_capital", "reg_date", "reg_checked"]
+
+# 舊版資料庫自動補上新欄位（ALTER TABLE ADD COLUMN），已有的資料不受影響
+MIGRATIONS = {
+    "items": [("drawing_no", "TEXT DEFAULT ''"), ("revision", "TEXT DEFAULT ''"), ("material", "TEXT DEFAULT ''"),
+              ("finish", "TEXT DEFAULT ''"), ("customer_id", "INTEGER"), ("cycle_min", "REAL DEFAULT 0")],
+    "partners": [("short_name", "TEXT DEFAULT ''"), ("grp", "TEXT DEFAULT ''"), ("fax", "TEXT DEFAULT ''"),
+                 ("email", "TEXT DEFAULT ''"), ("owner", "TEXT DEFAULT ''"), ("reg_status", "TEXT DEFAULT ''"),
+                 ("reg_capital", "TEXT DEFAULT ''"), ("reg_date", "TEXT DEFAULT ''"),
+                 ("reg_checked", "TEXT DEFAULT ''")],
+}
 ORDER_PREFIX = {"purchase": "PO", "sales": "SO"}
 
 
@@ -156,6 +171,12 @@ def init_db(path=None):
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        for table, cols in MIGRATIONS.items():
+            have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for col, decl in cols:
+                if col not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        conn.commit()
     finally:
         conn.close()
 
@@ -205,27 +226,91 @@ def next_no(conn, table, prefix):
 
 # ---------------------------------------------------------------- items
 
-def list_items(conn, q):
-    sql = """SELECT i.*, COALESCE(SUM(m.qty), 0) AS stock
-             FROM items i LEFT JOIN stock_moves m ON m.item_id = i.id
-             WHERE i.active = 1"""
-    args = []
+LAST_DATE_SQL = """MAX(COALESCE((SELECT MAX(h.doc_date) FROM history h WHERE h.item_code = i.code), ''),
+                        COALESCE((SELECT MAX(o.order_date) FROM order_lines l JOIN orders o ON o.id = l.order_id
+                                  WHERE l.item_id = i.id AND o.status != 'cancelled'), ''))"""
+
+
+def _item_where(q):
+    where, args = ["i.active = 1"], []
     if q.get("category"):
-        sql += " AND i.category = ?"
+        where.append("i.category = ?")
         args.append(q["category"])
-    if q.get("search"):
-        sql += " AND (i.code LIKE ? OR i.name LIKE ? OR i.spec LIKE ?)"
-        args += [f"%{q['search']}%"] * 3
-    sql += " GROUP BY i.id ORDER BY i.category, i.code"
+    if q.get("customer_id"):
+        where.append("i.customer_id = ?")
+        args.append(int(q["customer_id"]))
+    for word in (q.get("search") or "").split():
+        where.append("(i.code LIKE ? OR i.name LIKE ? OR i.spec LIKE ? OR i.drawing_no LIKE ? OR i.material LIKE ?)")
+        args += [f"%{word}%"] * 5
+    return " AND ".join(where), args
+
+
+def list_items(conn, q):
+    """全部品項（下拉選單、開單用）。lite=1 只回傳必要欄位。"""
+    where, args = _item_where(q)
+    cols = ("i.id, i.code, i.name, i.spec, i.unit, i.category, i.price, i.cost, i.customer_id, i.drawing_no"
+            if q.get("lite") else "i.*")
+    sql = f"""SELECT {cols}, COALESCE((SELECT SUM(qty) FROM stock_moves m WHERE m.item_id = i.id), 0) AS stock
+              FROM items i WHERE {where} ORDER BY i.category, i.code"""
     return rows(conn.execute(sql, args))
+
+
+ITEM_SORTS = {"code": "i.code", "name": "i.name", "stock": "stock", "value": "stock * i.cost",
+              "last": "last_date", "category": "i.category, i.code", "drawing": "i.drawing_no"}
+
+
+def page_items(conn, q):
+    """庫存品項頁：分頁、排序、篩選。"""
+    where, args = _item_where(q)
+    base = f"""SELECT i.*, p.name AS customer_name, p.short_name AS customer_short,
+                      COALESCE((SELECT SUM(qty) FROM stock_moves m WHERE m.item_id = i.id), 0) AS stock,
+                      {LAST_DATE_SQL} AS last_date
+               FROM items i LEFT JOIN partners p ON p.id = i.customer_id WHERE {where}"""
+    if q.get("low"):
+        base = f"SELECT * FROM ({base}) i WHERE i.safety_stock > 0 AND i.stock < i.safety_stock"
+    else:
+        base = f"SELECT * FROM ({base}) i"
+    order = ITEM_SORTS.get(q.get("sort") or "code", "i.code")
+    direction = "DESC" if q.get("dir") == "desc" else "ASC"
+    per = min(max(int(q.get("per") or 50), 10), 500)
+    page = max(int(q.get("page") or 1), 1)
+    total, value = conn.execute(f"SELECT COUNT(*), COALESCE(SUM(stock * cost), 0) FROM ({base})", args).fetchone()
+    data = rows(conn.execute(f"{base} ORDER BY {order} {direction}, i.code LIMIT ? OFFSET ?",
+                             args + [per, (page - 1) * per]))
+    return {"rows": data, "total": total, "value": value, "page": page, "per": per}
+
+
+def item_detail(conn, item_id):
+    it = conn.execute(
+        """SELECT i.*, p.name AS customer_name, COALESCE((SELECT SUM(qty) FROM stock_moves m
+               WHERE m.item_id = i.id), 0) AS stock FROM items i LEFT JOIN partners p ON p.id = i.customer_id
+           WHERE i.id = ?""", (item_id,)).fetchone()
+    if not it:
+        raise ApiError("找不到品項", 404)
+    it = dict(it)
+    hist = list_history(conn, {"item_code": it["code"], "limit": 30})
+    sub = f"SELECT * FROM ({HISTORY_UNION}) WHERE item_code = ?"
+    buyers = rows(conn.execute(
+        f"""SELECT partner_id, partner_name, kind, COUNT(*) AS times, SUM(qty) AS qty, MAX(doc_date) AS last_date,
+                   (SELECT h2.unit_price FROM ({sub}) h2 WHERE h2.partner_name = h.partner_name
+                        AND h2.kind = h.kind ORDER BY h2.doc_date DESC LIMIT 1) AS last_price
+            FROM ({sub}) h GROUP BY partner_name, kind ORDER BY last_date DESC LIMIT 15""",
+        (it["code"], it["code"])))
+    open_lines = rows(conn.execute(
+        """SELECT o.id AS order_id, o.no, o.kind, o.due_date, p.name AS partner_name, l.qty, l.delivered_qty, l.unit_price
+           FROM order_lines l JOIN orders o ON o.id = l.order_id JOIN partners p ON p.id = o.partner_id
+           WHERE l.item_id = ? AND o.status IN ('open', 'partial') ORDER BY o.due_date""", (item_id,)))
+    wos = rows(conn.execute(WO_SQL + " WHERE w.item_id = ? AND w.status IN ('pending', 'in_progress')", (item_id,)))
+    return {"item": it, "history": hist, "partners": buyers, "open_lines": open_lines, "work_orders": wos}
 
 
 def clean_item(body):
     data = {f: body.get(f, "") for f in ITEM_FIELDS}
     if not str(data["code"]).strip() or not str(data["name"]).strip():
         raise ApiError("料號與品名為必填")
-    for f in ("safety_stock", "cost", "price"):
+    for f in ("safety_stock", "cost", "price", "cycle_min"):
         data[f] = num(data[f] or 0, f, 0)
+    data["customer_id"] = int(data["customer_id"]) if str(data["customer_id"] or "").strip() else None
     return data
 
 
@@ -244,7 +329,11 @@ def create_item(conn, body):
 
 
 def update_item(conn, item_id, body):
-    data = clean_item(body)
+    existing = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+    if not existing:
+        raise ApiError("找不到品項", 404)
+    # 沒送來的欄位保留原值（例如舊畫面、匯入只帶部分欄位）
+    data = clean_item({f: body.get(f, existing[f]) for f in ITEM_FIELDS})
     try:
         conn.execute(f"UPDATE items SET {','.join(f + '=?' for f in ITEM_FIELDS)} WHERE id = ?",
                      [data[f] for f in ITEM_FIELDS] + [item_id])
@@ -267,11 +356,41 @@ def list_partners(conn, q):
     if q.get("type"):
         sql += " AND type = ?"
         args.append(q["type"])
-    return rows(conn.execute(sql + " ORDER BY name", args))
+    data = rows(conn.execute(sql + " ORDER BY name", args))
+    if q.get("stats"):
+        year = today()[:4]
+        last_year = str(int(year) - 1)
+        stats = {r["partner_id"]: r for r in rows(conn.execute(
+            f"""SELECT partner_id, MAX(doc_date) AS last_date, COUNT(DISTINCT doc_no) AS docs,
+                       COALESCE(SUM(amount), 0) AS amount_total,
+                       COALESCE(SUM(CASE WHEN doc_date LIKE ? THEN amount END), 0) AS amount_year,
+                       COALESCE(SUM(CASE WHEN doc_date LIKE ? THEN amount END), 0) AS amount_last_year
+                FROM ({HISTORY_UNION}) WHERE partner_id IS NOT NULL GROUP BY partner_id""",
+            (year + "%", last_year + "%")))}
+        for p in data:
+            st = stats.get(p["id"], {})
+            for k in ("last_date", "docs", "amount_total", "amount_year", "amount_last_year"):
+                p[k] = st.get(k) or (0 if k != "last_date" else "")
+    return data
+
+
+def batch_partners(conn, body):
+    """多選後一次改分類或改成客戶 / 供應商。"""
+    ids = [int(i) for i in body.get("ids") or []]
+    if not ids:
+        raise ApiError("請先勾選")
+    changes = body.get("set") or {}
+    if "type" in changes and changes["type"] not in ("customer", "supplier"):
+        raise ApiError("類型必須是客戶或供應商")
+    for col in ("type", "grp"):
+        if col in changes:
+            conn.executemany(f"UPDATE partners SET {col} = ? WHERE id = ?",
+                             [(str(changes[col]).strip(), i) for i in ids])
+    return {"ok": True, "count": len(ids)}
 
 
 def clean_partner(body):
-    data = {f: body.get(f, "") for f in PARTNER_FIELDS}
+    data = {f: (body.get(f) or "") for f in PARTNER_FIELDS}
     if data["type"] not in ("customer", "supplier"):
         raise ApiError("類型必須是客戶或供應商")
     if not str(data["name"]).strip():
@@ -288,7 +407,10 @@ def create_partner(conn, body):
 
 
 def update_partner(conn, pid, body):
-    data = clean_partner(body)
+    existing = conn.execute("SELECT * FROM partners WHERE id = ?", (pid,)).fetchone()
+    if not existing:
+        raise ApiError("找不到客戶 / 廠商", 404)
+    data = clean_partner({f: body.get(f, existing[f]) for f in PARTNER_FIELDS})
     conn.execute(f"UPDATE partners SET {','.join(f + '=?' for f in PARTNER_FIELDS)} WHERE id = ?",
                  [data[f] for f in PARTNER_FIELDS] + [pid])
     return {"ok": True}
@@ -649,6 +771,71 @@ def last_prices(conn, q):
         (pid, pname, kind, item["code"])))
 
 
+# ---------------------------------------------------------------- 公司登記查詢（經濟部商工登記公示資料開放 API）
+
+GCIS_API = "https://data.gcis.nat.gov.tw/od/data/api/"
+GCIS_COMPANY = "5F64D864-61CB-4D0D-8AD9-492047CC1EA6"   # 公司登記基本資料-應用一（依統編）
+GCIS_BUSINESS = "7E6AFA72-AD6A-46D3-8681-ED77951D912D"  # 商業登記基本資料-應用一（行號，依統編）
+FINDBIZ_URL = "https://findbiz.nat.gov.tw/fts/query/QueryBar/queryInit.do"
+
+
+def _gcis_get(guid, filt):
+    import urllib.parse
+    import urllib.request
+    url = GCIS_API + guid + "?" + urllib.parse.urlencode(
+        {"$format": "json", "$filter": filt, "$skip": 0, "$top": 1})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 CNC-ERP"})
+    with urllib.request.urlopen(req, timeout=10) as res:
+        body = res.read().decode("utf-8-sig").strip()
+    if not body:
+        return None
+    data = json.loads(body)
+    return data[0] if isinstance(data, list) and data else None
+
+
+def _roc_date(s):
+    s = str(s or "").strip()
+    if re.fullmatch(r"\d{7}", s):
+        return f"{int(s[:3]) + 1911}-{s[3:5]}-{s[5:]}"
+    return s
+
+
+def parse_gcis(rec):
+    """把公司或商業登記的回傳整理成統一格式。欄位名稱兩種都試。"""
+    if not rec:
+        return None
+    pick = lambda *keys: next((str(rec[k]).strip() for k in keys if rec.get(k) not in (None, "")), "")
+    capital = pick("Capital_Stock_Amount", "Paid_In_Capital_Amount", "Business_Register_Funds")
+    if capital.replace(",", "").isdigit():
+        capital = f"{int(capital.replace(',', '')):,}"
+    return {
+        "name": pick("Company_Name", "Business_Name"),
+        "owner": pick("Responsible_Name"),
+        "address": pick("Company_Location", "Business_Address"),
+        "capital": capital,
+        "setup_date": _roc_date(pick("Company_Setup_Date", "Business_Setup_Approve_Date")),
+        "status": pick("Company_Status_Desc", "Business_Current_Status_Desc"),
+    }
+
+
+def company_lookup(conn, q):
+    tax_id = re.sub(r"\D", "", q.get("tax_id") or "")
+    if len(tax_id) != 8:
+        raise ApiError("需要 8 碼統一編號才能查詢")
+    errors = []
+    for guid, filt, kind in ((GCIS_COMPANY, f"Business_Accounting_NO eq {tax_id}", "公司"),
+                             (GCIS_BUSINESS, f"President_No eq {tax_id}", "商號")):
+        try:
+            found = parse_gcis(_gcis_get(guid, filt))
+        except Exception as e:  # 沒網路、憑證、對方系統維護…
+            errors.append(f"{kind}：{e}")
+            continue
+        if found and found["name"]:
+            found.update({"found": True, "kind": kind, "tax_id": tax_id})
+            return found
+    return {"found": False, "tax_id": tax_id, "errors": errors, "manual_url": FINDBIZ_URL}
+
+
 # ---------------------------------------------------------------- dashboard
 
 def dashboard(conn, q):
@@ -679,7 +866,12 @@ def dashboard(conn, q):
            FROM stock_moves m JOIN orders o ON o.no = m.ref
            WHERE m.kind = '出貨' AND m.move_date LIKE ?""", (month + "%",)).fetchone()[0]
     wos = rows(conn.execute(WO_SQL + " WHERE w.status IN ('pending', 'in_progress') ORDER BY w.due_date"))
+    for w in wos:
+        cyc = conn.execute("SELECT cycle_min FROM items WHERE id = ?", (w["item_id"],)).fetchone()[0] or 0
+        w["est_hours"] = round(cyc * w["qty"] / 60, 1) if cyc else None
+    extra = dashboard_trends(conn, t)
     return {
+        **extra,
         "today": t,
         "low_stock": low,
         "overdue_sales": overdue,
@@ -689,6 +881,69 @@ def dashboard(conn, q):
         "payable": balances.get("purchase", 0),
         "month_sales": month_sales,
         "work_orders": wos,
+    }
+
+
+def dashboard_trends(conn, t):
+    """總覽的經營數字：月銷售趨勢、今年 vs 去年、前十大客戶、久未下單的老客戶、機台負荷、常回單零件。
+    銷售金額包含舊系統匯入的紀錄與本系統的訂單。"""
+    year, month = int(t[:4]), int(t[5:7])
+    sales = f"SELECT * FROM ({HISTORY_UNION}) WHERE kind = 'sales' AND doc_date != ''"
+    months = []
+    for k in range(11, -1, -1):
+        y, m = year, month - k
+        while m <= 0:
+            y, m = y - 1, m + 12
+        months.append(f"{y:04d}-{m:02d}")
+    by_month = dict(conn.execute(
+        f"SELECT SUBSTR(doc_date, 1, 7), COALESCE(SUM(amount), 0) FROM ({sales}) WHERE doc_date >= ? GROUP BY 1",
+        (months[0] + "-01",)).fetchall())
+    last_year_same = dict(conn.execute(
+        f"SELECT SUBSTR(doc_date, 1, 7), COALESCE(SUM(amount), 0) FROM ({sales}) WHERE doc_date >= ? AND doc_date < ? GROUP BY 1",
+        (f"{int(months[0][:4]) - 1}{months[0][4:]}-01", months[0] + "-01")).fetchall())
+    ytd = conn.execute(f"SELECT COALESCE(SUM(amount), 0) FROM ({sales}) WHERE doc_date >= ? AND doc_date <= ?",
+                       (f"{year}-01-01", t)).fetchone()[0]
+    last_ytd = conn.execute(f"SELECT COALESCE(SUM(amount), 0) FROM ({sales}) WHERE doc_date >= ? AND doc_date <= ?",
+                            (f"{year - 1}-01-01", f"{year - 1}{t[4:]}")).fetchone()[0]
+    since = _plus_days(t, -365)
+    top = rows(conn.execute(
+        f"""SELECT s.partner_id, COALESCE(NULLIF(p.short_name, ''), s.partner_name) AS name,
+                   SUM(s.amount) AS amount, COUNT(DISTINCT s.doc_no) AS docs
+            FROM ({sales}) s LEFT JOIN partners p ON p.id = s.partner_id
+            WHERE s.doc_date >= ? GROUP BY COALESCE(s.partner_id, s.partner_name) ORDER BY amount DESC LIMIT 10""",
+        (since,)))
+    total_12m = conn.execute(f"SELECT COALESCE(SUM(amount), 0) FROM ({sales}) WHERE doc_date >= ?",
+                             (since,)).fetchone()[0]
+    # 以前常來（至少 3 張單）、但超過 120 天沒下單的客戶 → 該打電話關心了
+    dormant = rows(conn.execute(
+        f"""SELECT s.partner_id, COALESCE(NULLIF(p.short_name, ''), s.partner_name) AS name, p.phone,
+                   MAX(s.doc_date) AS last_date, COUNT(DISTINCT s.doc_no) AS docs,
+                   SUM(CASE WHEN s.doc_date >= ? THEN s.amount ELSE 0 END) AS amount_3y
+            FROM ({sales}) s LEFT JOIN partners p ON p.id = s.partner_id
+            GROUP BY COALESCE(s.partner_id, s.partner_name)
+            HAVING docs >= 3 AND last_date < ? AND last_date >= ?
+            ORDER BY amount_3y DESC LIMIT 10""",
+        (_plus_days(t, -365 * 3), _plus_days(t, -120), _plus_days(t, -365 * 3))))
+    # 近兩年最常回單的零件（適合先備料）
+    repeat = rows(conn.execute(
+        f"""SELECT item_code, MAX(item_name) AS item_name, COUNT(DISTINCT doc_no) AS times, SUM(qty) AS qty,
+                   MAX(doc_date) AS last_date, COUNT(DISTINCT partner_name) AS customers
+            FROM ({sales}) WHERE doc_date >= ? AND item_code != ''
+            GROUP BY item_code HAVING times >= 3 ORDER BY times DESC LIMIT 10""",
+        (_plus_days(t, -730),)))
+    machines = rows(conn.execute(
+        """SELECT COALESCE(NULLIF(w.machine, ''), '（未指定機台）') AS machine, COUNT(*) AS orders,
+                  SUM(w.qty) AS qty, SUM(w.qty * COALESCE(i.cycle_min, 0)) / 60.0 AS hours,
+                  SUM(CASE WHEN COALESCE(i.cycle_min, 0) = 0 THEN 1 ELSE 0 END) AS no_cycle,
+                  MIN(NULLIF(w.due_date, '')) AS next_due
+           FROM work_orders w JOIN items i ON i.id = w.item_id
+           WHERE w.status IN ('pending', 'in_progress') GROUP BY 1 ORDER BY hours DESC"""))
+    return {
+        "months": [{"month": m, "amount": by_month.get(m, 0),
+                    "last_year": last_year_same.get(f"{int(m[:4]) - 1}{m[4:]}", 0)} for m in months],
+        "ytd": ytd, "last_ytd": last_ytd,
+        "top_customers": top, "total_12m": total_12m,
+        "dormant": dormant, "repeat_parts": repeat, "machines": machines,
     }
 
 
@@ -756,10 +1011,14 @@ ROUTES = [
     ("GET", r"/api/dashboard", lambda c, q, b: dashboard(c, q)),
     ("GET", r"/api/items", lambda c, q, b: list_items(c, q)),
     ("POST", r"/api/items", lambda c, q, b: create_item(c, b)),
+    ("GET", r"/api/items/page", lambda c, q, b: page_items(c, q)),
+    ("GET", r"/api/items/(\d+)", lambda c, q, b, i: item_detail(c, int(i))),
     ("PUT", r"/api/items/(\d+)", lambda c, q, b, i: update_item(c, int(i), b)),
     ("DELETE", r"/api/items/(\d+)", lambda c, q, b, i: delete_item(c, int(i))),
     ("GET", r"/api/partners", lambda c, q, b: list_partners(c, q)),
     ("POST", r"/api/partners", lambda c, q, b: create_partner(c, b)),
+    ("POST", r"/api/partners/batch", lambda c, q, b: batch_partners(c, b)),
+    ("GET", r"/api/company-lookup", lambda c, q, b: company_lookup(c, q)),
     ("GET", r"/api/partners/(\d+)/summary", lambda c, q, b, i: partner_summary(c, int(i))),
     ("PUT", r"/api/partners/(\d+)", lambda c, q, b, i: update_partner(c, int(i), b)),
     ("DELETE", r"/api/partners/(\d+)", lambda c, q, b, i: delete_partner(c, int(i))),

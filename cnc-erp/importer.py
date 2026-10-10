@@ -319,6 +319,9 @@ def apply_partners(conn, records, ptype):
         data = {"type": ptype, "name": rec["name"], "contact": rec.get("contact", ""),
                 "phone": rec.get("phone", ""), "tax_id": rec.get("tax_id", ""),
                 "address": rec.get("address", ""), "note": note}
+        for extra in ("short_name", "fax", "email", "owner", "grp"):
+            if rec.get(extra):
+                data[extra] = rec[extra]
         existing = conn.execute("SELECT * FROM partners WHERE type = ? AND name = ?",
                                 (ptype, rec["name"])).fetchone()
         if existing:

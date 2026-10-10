@@ -349,12 +349,10 @@ def run(conn, raw, options):
             "name": name, "old_code": c.get("NO", ""), "contact": c.get("CONTACT", ""),
             "phone": c.get("TEL", ""), "tax_id": c.get("UNIFORM", ""),
             "address": c.get("ADDR1", "") or c.get("ADDR2", ""),
-            "note": _join(f"簡稱 {c['S_NAME']}" if c.get("S_NAME") and c.get("S_NAME") != name else "",
-                          f"傳真 {c['FAX']}" if c.get("FAX") else "",
-                          f"負責人 {c['PRESIDT']}" if c.get("PRESIDT") else "",
-                          f"Email {c['E_MAIL']}" if c.get("E_MAIL") else "",
-                          f"送貨地址 {c['ADDR2']}" if c.get("ADDR2") and c.get("ADDR1") else "",
-                          c.get("REM", "")),
+            "short_name": c.get("S_NAME", ""), "fax": c.get("FAX", ""), "email": c.get("E_MAIL", ""),
+            "owner": c.get("PRESIDT", ""),
+            "note": _join(f"送貨地址 {c['ADDR2']}" if c.get("ADDR2") and c.get("ADDR1") else "",
+                          f"發票地址 {c['ADDR3']}" if c.get("ADDR3") else "", c.get("REM", "")),
         })
     if parts.get("partners"):
         summary["partners"] = {t: importer.apply_partners(conn, recs, t) for t, recs in partner_records.items()}

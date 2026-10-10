@@ -105,6 +105,7 @@ function go(view) {
 async function render() {
   const [view, arg] = decodeURIComponent(location.hash.slice(1) || "dashboard").split(":");
   const navView = view === "partner" ? "partners" : view;
+  if (view === "partners" && arg) partnersState().type = arg;
   $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === navView));
   app.innerHTML = '<p class="muted">載入中…</p>';
   try {
@@ -119,100 +120,303 @@ const refresh = () => render();
 
 // ---------------------------------------------------------------- 總覽
 
+function pct(a, b) {
+  if (!b) return "";
+  const p = ((a - b) / b) * 100;
+  return `<span class="${p >= 0 ? "up" : "down"}">${p >= 0 ? "▲" : "▼"} ${Math.abs(p).toFixed(0)}%</span>`;
+}
+
+// 近 12 個月銷貨長條圖：今年用長條，去年同月用細橫線，滑鼠移上去看數字
+function monthChart(months) {
+  const max = Math.max(1, ...months.map((m) => Math.max(m.amount, m.last_year)));
+  const cols = months.map((m, i) => {
+    const h = (m.amount / max) * 100, ly = (m.last_year / max) * 100;
+    const last = i === months.length - 1;
+    return `<div class="mc-col" data-tip="${esc(m.month)}　今年 ${money(m.amount)}　去年同月 ${money(m.last_year)}">
+      <div class="mc-plot">
+        ${last && m.amount ? `<div class="mc-val" style="bottom:${h}%">${money(m.amount)}</div>` : ""}
+        <div class="mc-bar" style="height:${h}%"></div>
+        ${m.last_year ? `<div class="mc-ly" style="bottom:${ly}%"></div>` : ""}
+      </div>
+      <div class="mc-x">${Number(m.month.slice(5))}月</div></div>`;
+  }).join("");
+  return `<div class="mc-legend"><span><i class="sw-bar"></i>今年</span><span><i class="sw-ly"></i>去年同月</span>
+      <span class="muted">最高 ${money(max)}</span></div>
+    <div class="mc">${cols}</div>`;
+}
+
+function wireTips(root) {
+  let tip = $("#tip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "tip";
+    document.body.appendChild(tip);
+  }
+  $$("[data-tip]", root).forEach((el) => {
+    el.onmouseenter = () => { tip.textContent = el.dataset.tip; tip.style.opacity = 1; };
+    el.onmousemove = (e) => {
+      tip.style.left = Math.min(e.clientX + 12, window.innerWidth - tip.offsetWidth - 8) + "px";
+      tip.style.top = e.clientY - 36 + "px";
+    };
+    el.onmouseleave = () => (tip.style.opacity = 0);
+  });
+}
+
 views.dashboard = async () => {
   const d = await api("GET", "/api/dashboard");
   const orderRow = (o) => `<tr class="clickable" data-order="${o.id}">
       <td>${esc(o.no)}</td><td>${esc(o.partner_name)}</td><td>${dueTag(o)}</td><td>${statusTag(o.status)}</td></tr>`;
+  const thisMonth = d.months[d.months.length - 1];
+  const topMax = Math.max(1, ...d.top_customers.map((c) => c.amount));
+  const daysAgo = (iso) => Math.round((new Date(d.today) - new Date(iso)) / 86400000);
   app.innerHTML = `
     <h1>今日總覽 <span class="muted" style="font-size:16px;font-weight:400">${d.today}</span></h1>
     <div class="kpis">
-      <div class="kpi"><div class="label">本月出貨金額</div><div class="value">${money(d.month_sales)}</div></div>
-      <div class="kpi"><div class="label">應收帳款（已出貨未收）</div><div class="value">${money(d.receivable)}</div></div>
-      <div class="kpi"><div class="label">應付帳款（已進貨未付）</div><div class="value">${money(d.payable)}</div></div>
-      <div class="kpi ${d.overdue_sales.length ? "alert" : ""}"><div class="label">逾期未交訂單</div><div class="value">${d.overdue_sales.length}</div></div>
-      <div class="kpi ${d.low_stock.length ? "alert" : ""}"><div class="label">低於安全庫存</div><div class="value">${d.low_stock.length}</div></div>
+      <div class="kpi"><div class="label">本月銷貨</div><div class="value">${money(thisMonth.amount)}</div>
+        <div class="sub">去年同月 ${money(thisMonth.last_year)} ${pct(thisMonth.amount, thisMonth.last_year)}</div></div>
+      <div class="kpi"><div class="label">今年累計銷貨</div><div class="value">${money(d.ytd)}</div>
+        <div class="sub">去年同期 ${money(d.last_ytd)} ${pct(d.ytd, d.last_ytd)}</div></div>
+      <div class="kpi"><div class="label">應收帳款</div><div class="value">${money(d.receivable)}</div>
+        <div class="sub">已出貨未收款</div></div>
+      <div class="kpi"><div class="label">應付帳款</div><div class="value">${money(d.payable)}</div>
+        <div class="sub">已進貨未付款</div></div>
+      <div class="kpi ${d.overdue_sales.length ? "alert" : ""}"><div class="label">逾期未交訂單</div><div class="value">${d.overdue_sales.length}</div>
+        <div class="sub">7 天內要交 ${d.due_soon_sales.length} 張</div></div>
+      <div class="kpi ${d.low_stock.length ? "alert" : ""}"><div class="label">低於安全庫存</div><div class="value">${d.low_stock.length}</div>
+        <div class="sub"><a class="plink" id="see-low">看清單</a></div></div>
     </div>
+
+    <h2 class="section">今天要處理</h2>
     <div class="grid">
       <div class="card"><h3>⚠️ 逾期未交貨</h3>
         ${table(["單號", "客戶", "交期", "狀態"], d.overdue_sales.map(orderRow), "沒有逾期訂單 👍")}</div>
       <div class="card"><h3>📅 7 天內要交貨</h3>
         ${table(["單號", "客戶", "交期", "狀態"], d.due_soon_sales.map(orderRow), "近期沒有要交的訂單")}</div>
+      <div class="card"><h3>🚚 等待供應商交貨（材料 / 外包）</h3>
+        ${table(["單號", "供應商", "預計到貨", "狀態"], d.open_purchase.map(orderRow), "沒有未到貨的採購單")}</div>
+      <div class="card"><h3>📦 需要補貨</h3>
+        ${table(["料號", "品名", ["庫存", "num"], ["安全量", "num"]], d.low_stock.slice(0, 8).map((i) => `
+          <tr class="clickable" data-item="${i.id}"><td>${esc(i.code)}</td><td>${esc(i.name)}</td>
+          <td class="num">${n(i.stock)} ${esc(i.unit)}</td><td class="num">${n(i.safety_stock)}</td></tr>`), "庫存都充足")}
+        ${d.low_stock.length > 8 ? `<p class="muted">還有 ${d.low_stock.length - 8} 項…</p>` : ""}</div>
+    </div>
+
+    <h2 class="section">生產現場</h2>
+    <div class="grid">
+      <div class="card"><h3>⚙️ 機台負荷（未完工工單）</h3>
+        ${table(["機台", ["工單", "num"], ["數量", "num"], ["預估工時", "num"], "最近交期"], d.machines.map((m) => `<tr>
+          <td>${esc(m.machine)}</td><td class="num">${n(m.orders)}</td><td class="num">${n(m.qty)}</td>
+          <td class="num">${m.hours ? n(Math.round(m.hours * 10) / 10) + " 小時" : "—"}${m.no_cycle ? `<span class="muted">（${m.no_cycle} 張未設工時）</span>` : ""}</td>
+          <td>${esc(m.next_due || "")}</td></tr>`), "目前沒有未完工的工單")}
+        <p class="muted" style="margin-bottom:0">在品項裡填「單件工時」就能算出每台機器還要做多久。</p></div>
       <div class="card"><h3>🏭 進行中工單</h3>
-        ${table(["工單", "品名", "數量", "機台", "交期", "狀態"], d.work_orders.map((w) => `
+        ${table(["工單", "品名", ["數量", "num"], "機台", "交期", "狀態"], d.work_orders.map((w) => `
           <tr class="clickable" data-wo="${w.id}"><td>${esc(w.no)}</td><td>${esc(w.name)}</td>
           <td class="num">${n(w.qty)}</td><td>${esc(w.machine)}</td><td>${dueTag(w)}</td><td>${statusTag(w.status)}</td></tr>`),
           "目前沒有工單")}</div>
-      <div class="card"><h3>📦 需要補貨（低於安全庫存）</h3>
-        ${table(["料號", "品名", ["庫存", "num"], ["安全量", "num"]], d.low_stock.map((i) => `
-          <tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td class="num">${n(i.stock)} ${esc(i.unit)}</td>
-          <td class="num">${n(i.safety_stock)}</td></tr>`), "庫存都充足")}</div>
-      <div class="card"><h3>🚚 等待供應商交貨</h3>
-        ${table(["單號", "供應商", "預計到貨", "狀態"], d.open_purchase.map(orderRow), "沒有未到貨的採購單")}</div>
+    </div>
+
+    <h2 class="section">經營狀況 <span class="muted" style="font-size:14px;font-weight:400">（含凌越轉入的歷史紀錄）</span></h2>
+    <div class="card"><h3>📈 近 12 個月銷貨金額</h3>${monthChart(d.months)}</div>
+    <div class="grid">
+      <div class="card"><h3>🏆 近一年前十大客戶</h3>
+        ${table(["客戶", ["金額", "num"], "占比"], d.top_customers.map((c) => `
+          <tr class="${c.partner_id ? "clickable" : ""}" ${c.partner_id ? `data-pid="${c.partner_id}"` : ""}>
+          <td>${esc(c.name)}</td><td class="num">${money(c.amount)}</td>
+          <td style="min-width:120px"><div class="share"><div style="width:${(c.amount / topMax) * 100}%"></div></div>
+            <span class="muted">${d.total_12m ? Math.round((c.amount / d.total_12m) * 100) : 0}%</span></td></tr>`),
+          "近一年沒有銷貨紀錄")}
+        ${d.top_customers[0] && d.total_12m && d.top_customers[0].amount / d.total_12m > 0.4
+          ? '<p class="warn-text">⚠️ 最大客戶占超過四成，訂單過度集中，要留意風險。</p>' : ""}</div>
+      <div class="card"><h3>📞 久未下單的老客戶</h3>
+        <p class="muted" style="margin-top:0">以前常下單（3 張以上），但超過 4 個月沒有訂單，可以打電話問候。</p>
+        ${table(["客戶", "電話", "最後下單", ["近三年金額", "num"]], d.dormant.map((c) => `
+          <tr class="${c.partner_id ? "clickable" : ""}" ${c.partner_id ? `data-pid="${c.partner_id}"` : ""}>
+          <td>${esc(c.name)}</td><td>${esc(c.phone || "")}</td>
+          <td>${esc(c.last_date)} <span class="muted">（${daysAgo(c.last_date)} 天）</span></td>
+          <td class="num">${money(c.amount_3y)}</td></tr>`), "老客戶都有持續下單 👍")}</div>
+      <div class="card"><h3>🔁 常回單的零件（近兩年）</h3>
+        <p class="muted" style="margin-top:0">重複下單次數多的零件，可以考慮先備料或預做。</p>
+        ${table(["料號", "品名", ["次數", "num"], ["總數量", "num"], "最近"], d.repeat_parts.map((r) => `
+          <tr class="clickable" data-code="${esc(r.item_code)}"><td>${esc(r.item_code)}</td><td>${esc(r.item_name)}</td>
+          <td class="num">${n(r.times)}</td><td class="num">${n(r.qty)}</td><td>${esc(r.last_date)}</td></tr>`), "還沒有足夠的紀錄")}</div>
     </div>`;
   $$("[data-order]").forEach((tr) => (tr.onclick = () => showOrder(tr.dataset.order)));
   $$("[data-wo]").forEach((tr) => (tr.onclick = () => showWorkOrder(tr.dataset.wo)));
+  $$("[data-item]").forEach((tr) => (tr.onclick = () => showItem(tr.dataset.item)));
+  $$("[data-pid]").forEach((tr) => (tr.onclick = () => go("partner:" + tr.dataset.pid)));
+  $$("[data-code]").forEach((tr) => (tr.onclick = () => {
+    views.history.state = { search: tr.dataset.code, kind: "sales", date_from: "", date_to: "" };
+    go("history");
+  }));
+  $("#see-low").onclick = () => { itemsState().low = true; itemsState().page = 1; go("items"); };
+  wireTips(app);
 };
 
 // ---------------------------------------------------------------- 品項
 
+const MATERIALS = ["AL6061", "AL7075", "AL5052", "SUS304", "SUS316", "SUS303", "SUS420", "S45C", "SCM440",
+  "SKD11", "SKD61", "SS400", "黃銅 C3604", "紅銅", "鈦合金", "POM", "PEEK", "MC 尼龍", "壓克力"];
+const FINISHES = ["無", "陽極處理", "硬陽極", "黑色陽極", "鍍鎳", "化學鍍鎳", "鍍鉻", "鍍鋅", "黑染", "噴砂",
+  "電解研磨", "淬火", "高週波", "滲碳", "真空熱處理", "調質", "氮化"];
+
+function datalist(id, values) {
+  return `<datalist id="${id}">${values.map((v) => `<option value="${esc(v)}">`).join("")}</datalist>`;
+}
+
+const itemsState = () => views.items.state || (views.items.state = {
+  search: "", category: "", customer_id: "", low: false, sort: "code", dir: "asc", page: 1, per: 50 });
+
+let customerCache = null;
+async function customers(force) {
+  if (!customerCache || force) customerCache = await api("GET", "/api/partners?type=customer");
+  return customerCache;
+}
+const pname = (p) => p.short_name || p.name;
+
 views.items = async () => {
-  const state = views.items.state || (views.items.state = { search: "", category: "" });
-  const qs = new URLSearchParams(state).toString();
-  const items = await api("GET", "/api/items?" + qs);
-  const totalValue = items.reduce((s, i) => s + i.stock * i.cost, 0);
+  const st = itemsState();
+  const q = { ...st, low: st.low ? "1" : "" };
+  const [res, cus] = await Promise.all([api("GET", "/api/items/page?" + new URLSearchParams(q)), customers()]);
+  const pages = Math.max(1, Math.ceil(res.total / res.per));
+  const sortHead = (key, label, cls = "") => {
+    const on = st.sort === key;
+    return [`<a class="sort ${on ? "on" : ""}" data-sort="${key}">${label}${on ? (st.dir === "asc" ? " ▲" : " ▼") : ""}</a>`, cls];
+  };
+  const pager = `<div class="pager">
+      <button type="button" class="small ghost" data-page="${st.page - 1}" ${st.page <= 1 ? "disabled" : ""}>‹ 上一頁</button>
+      <span>第 ${st.page} / ${pages} 頁</span>
+      <button type="button" class="small ghost" data-page="${st.page + 1}" ${st.page >= pages ? "disabled" : ""}>下一頁 ›</button>
+      <select class="per">${[50, 100, 200].map((x) => `<option value="${x}" ${x === st.per ? "selected" : ""}>每頁 ${x} 筆</option>`).join("")}</select>
+    </div>`;
   app.innerHTML = `
     <h1>庫存品項 <span class="spacer"></span><button id="add">＋ 新增品項</button></h1>
     <div class="toolbar">
-      <input id="search" placeholder="搜尋料號 / 品名 / 規格" value="${esc(state.search)}">
+      <input id="search" placeholder="搜尋料號、品名、規格、圖號、材質" value="${esc(st.search)}" style="flex:1;min-width:220px">
       <select id="cat"><option value="">全部分類</option>${CATEGORIES.map((c) =>
-        `<option ${c === state.category ? "selected" : ""}>${c}</option>`).join("")}</select>
-      <span class="muted" style="align-self:center">共 ${items.length} 項，庫存金額約 ${money(totalValue)}</span>
+        `<option ${c === st.category ? "selected" : ""}>${c}</option>`).join("")}</select>
+      <select id="cus"><option value="">全部客戶</option>${cus.map((c) =>
+        `<option value="${c.id}" ${String(c.id) === String(st.customer_id) ? "selected" : ""}>${esc(pname(c))}</option>`).join("")}</select>
+      <label><input type="checkbox" id="low" ${st.low ? "checked" : ""}> 只看低於安全庫存</label>
     </div>
-    <div class="card">${table(
-      ["料號", "品名", "分類", "規格", ["庫存", "num"], ["安全量", "num"], "儲位", ""],
-      items.map((i) => `<tr class="${i.safety_stock && i.stock < i.safety_stock ? "low" : ""}">
-        <td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.category)}</td><td>${esc(i.spec)}</td>
-        <td class="num">${n(i.stock)} ${esc(i.unit)}</td><td class="num">${n(i.safety_stock)}</td>
-        <td>${esc(i.location)}</td>
-        <td style="white-space:nowrap"><button class="small ghost" data-edit="${i.id}">編輯</button>
-          <button class="small ghost" data-count="${i.id}">盤點</button>
-          <button class="small ghost" data-moves="${i.id}">異動</button></td></tr>`),
-      "還沒有品項，請按「新增品項」")}</div>`;
+    <p class="muted">共 ${n(res.total)} 項，庫存金額約 ${money(res.value)}。點一下任一列可看詳細資料、盤點、修改。</p>
+    <div class="card">
+      ${pager}
+      ${table([sortHead("code", "料號"), sortHead("name", "品名"), sortHead("drawing", "圖號 / 版次"), "材質", "規格", "客戶",
+        sortHead("stock", "庫存", "num"), ["安全量", "num"], sortHead("last", "最近交易")],
+        res.rows.map((i) => `<tr class="clickable ${i.safety_stock && i.stock < i.safety_stock ? "low" : ""}" data-item="${i.id}">
+          <td>${esc(i.code)}</td><td class="ellipsis">${esc(i.name)}</td>
+          <td>${esc(i.drawing_no)}${i.revision ? ` <span class="muted">${esc(i.revision)}</span>` : ""}</td>
+          <td>${esc(i.material)}</td><td class="ellipsis">${esc(i.spec)}</td>
+          <td class="ellipsis">${esc(i.customer_short || i.customer_name || "")}</td>
+          <td class="num">${n(i.stock)} ${esc(i.unit)}</td><td class="num">${i.safety_stock ? n(i.safety_stock) : ""}</td>
+          <td>${esc(i.last_date || "")}</td></tr>`),
+        st.search || st.category || st.customer_id || st.low ? "沒有符合條件的品項" : "還沒有品項，請按「新增品項」")}
+      ${res.total > res.per ? pager : ""}
+    </div>`;
   let timer;
   $("#search").oninput = (e) => {
     clearTimeout(timer);
-    timer = setTimeout(() => { state.search = e.target.value; refresh(); }, 300);
+    timer = setTimeout(() => { st.search = e.target.value; st.page = 1; refresh(); }, 350);
   };
-  if (state.search) $("#search").focus();
-  $("#search").setSelectionRange(state.search.length, state.search.length);
-  $("#cat").onchange = (e) => { state.category = e.target.value; refresh(); };
-  $("#add").onclick = () => itemForm();
-  const byId = Object.fromEntries(items.map((i) => [i.id, i]));
-  $$("[data-edit]").forEach((b) => (b.onclick = () => itemForm(byId[b.dataset.edit])));
-  $$("[data-count]").forEach((b) => (b.onclick = () => stockCount(byId[b.dataset.count])));
-  $$("[data-moves]").forEach((b) => (b.onclick = () => {
-    views.moves.state = { item_id: b.dataset.moves };
-    go("moves");
+  if (st.search) { $("#search").focus(); $("#search").setSelectionRange(st.search.length, st.search.length); }
+  $("#cat").onchange = (e) => { st.category = e.target.value; st.page = 1; refresh(); };
+  $("#cus").onchange = (e) => { st.customer_id = e.target.value; st.page = 1; refresh(); };
+  $("#low").onchange = (e) => { st.low = e.target.checked; st.page = 1; refresh(); };
+  $$("[data-sort]").forEach((a) => (a.onclick = () => {
+    st.dir = st.sort === a.dataset.sort && st.dir === "asc" ? "desc" : (a.dataset.sort === "last" || a.dataset.sort === "stock") && st.sort !== a.dataset.sort ? "desc" : "asc";
+    st.sort = a.dataset.sort;
+    st.page = 1;
+    refresh();
   }));
+  $$("[data-page]").forEach((b) => (b.onclick = () => { st.page = Number(b.dataset.page); refresh(); window.scrollTo(0, 0); }));
+  $$(".per").forEach((s) => (s.onchange = () => { st.per = Number(s.value); st.page = 1; refresh(); }));
+  $("#add").onclick = () => itemForm();
+  $$("[data-item]").forEach((tr) => (tr.onclick = () => showItem(tr.dataset.item)));
 };
 
-function itemForm(item) {
-  const i = item || { category: "原料", unit: "個" };
+async function showItem(id) {
+  const d = await api("GET", "/api/items/" + id);
+  const i = d.item;
+  const low = i.safety_stock && i.stock < i.safety_stock;
   modal({
-    title: item ? "編輯品項" : "新增品項",
+    title: `${i.code}　${i.name}`,
+    hideOk: true,
+    body: `
+      <div class="kpis" style="margin-bottom:12px">
+        <div class="kpi ${low ? "alert" : ""}"><div class="label">目前庫存</div><div class="value">${n(i.stock)} <small>${esc(i.unit)}</small></div>
+          <div class="sub">${i.safety_stock ? `安全量 ${n(i.safety_stock)}` : "未設安全量"}</div></div>
+        <div class="kpi"><div class="label">售價 / 成本</div><div class="value" style="font-size:20px">${n(i.price)} / ${n(i.cost)}</div>
+          <div class="sub">${i.price && i.cost ? `毛利約 ${Math.round(((i.price - i.cost) / i.price) * 100)}%` : ""}</div></div>
+        <div class="kpi"><div class="label">交易紀錄</div><div class="value">${n(d.history.count)}</div><div class="sub">筆</div></div>
+      </div>
+      <div class="detail-head">
+        <div><span>分類</span>${esc(i.category)}</div>
+        <div><span>客戶</span>${esc(i.customer_name || "—")}</div>
+        <div><span>客戶圖號</span>${esc(i.drawing_no || "—")} ${esc(i.revision || "")}</div>
+        <div><span>材質</span>${esc(i.material || "—")}</div>
+        <div><span>表面 / 熱處理</span>${esc(i.finish || "—")}</div>
+        <div><span>單件工時</span>${i.cycle_min ? n(i.cycle_min) + " 分鐘" : "—"}</div>
+        <div><span>規格</span>${esc(i.spec || "—")}</div>
+        <div><span>儲位</span>${esc(i.location || "—")}</div>
+        ${i.note ? `<div style="grid-column:1/-1"><span>備註</span>${esc(i.note)}</div>` : ""}
+      </div>
+      <div class="actions" style="justify-content:flex-start">
+        <button type="button" id="i-edit">修改資料</button>
+        <button type="button" class="ghost" id="i-count">盤點</button>
+        <button type="button" class="ghost" id="i-moves">庫存異動</button>
+        ${["成品", "半成品"].includes(i.category) ? '<button type="button" class="ghost" id="i-wo">開工單</button>' : ""}
+      </div>
+      ${d.open_lines.length ? `<h3>未結訂單</h3>${table(["單號", "對象", ["數量", "num"], ["已交", "num"], "交期"],
+        d.open_lines.map((l) => `<tr class="clickable" data-order="${l.order_id}"><td>${esc(l.no)}</td><td>${esc(l.partner_name)}</td>
+          <td class="num">${n(l.qty)}</td><td class="num">${n(l.delivered_qty)}</td><td>${esc(l.due_date)}</td></tr>`))}` : ""}
+      ${d.work_orders.length ? `<h3>生產中工單</h3>${table(["工單", ["數量", "num"], "機台", "交期", "狀態"],
+        d.work_orders.map((w) => `<tr><td>${esc(w.no)}</td><td class="num">${n(w.qty)}</td><td>${esc(w.machine)}</td>
+          <td>${esc(w.due_date)}</td><td>${statusTag(w.status)}</td></tr>`))}` : ""}
+      <h3 style="margin-top:16px">跟誰往來、最近價格</h3>
+      ${table(["對象", "", ["次數", "num"], ["數量", "num"], ["最近單價", "num"], "最近"], d.partners.map((p) => `<tr>
+        <td>${p.partner_id ? `<a class="plink" data-pid="${p.partner_id}">${esc(p.partner_name)}</a>` : esc(p.partner_name)}</td>
+        <td><span class="tag">${p.kind === "sales" ? "銷貨" : "進貨"}</span></td><td class="num">${n(p.times)}</td>
+        <td class="num">${n(p.qty)}</td><td class="num">${p.last_price == null ? "" : n(p.last_price)}</td>
+        <td>${esc(p.last_date)}</td></tr>`), "還沒有交易紀錄")}
+      <h3 style="margin-top:16px">最近交易</h3>
+      ${historyTable(d.history.rows)}`,
+    onOpen: () => {
+      const dlg = $("#modal");
+      $("#i-edit").onclick = () => itemForm(i);
+      $("#i-count").onclick = () => stockCount(i);
+      $("#i-moves").onclick = () => { dlg.close(); views.moves.state = { item_id: i.id }; go("moves"); };
+      if ($("#i-wo")) $("#i-wo").onclick = () => workOrderForm({ item_id: i.id });
+      $$("#modal [data-order]").forEach((tr) => (tr.onclick = () => showOrder(tr.dataset.order)));
+      $$("#modal .plink").forEach((a) => (a.onclick = () => { dlg.close(); go("partner:" + a.dataset.pid); }));
+    },
+  });
+}
+
+async function itemForm(item) {
+  const i = item || { category: "成品", unit: "個" };
+  const cus = await customers();
+  modal({
+    title: item ? `修改 ${item.code}` : "新增品項",
     body: `<div class="fields">
       ${field("料號 *", "code", i.code, "required")}
       ${field("品名 *", "name", i.name, "required")}
       ${selectField("分類", "category", CATEGORIES.map((c) => [c, c]), i.category)}
-      ${field("規格（材質 / 尺寸 / 圖號）", "spec", i.spec)}
+      ${selectField("所屬客戶", "customer_id", [["", "（無 / 通用）"], ...cus.map((c) => [c.id, pname(c)])], i.customer_id ?? "")}
+      ${field("客戶圖號", "drawing_no", i.drawing_no)}
+      ${field("版次", "revision", i.revision, 'placeholder="例：Rev.C"')}
+      ${field("材質", "material", i.material, 'list="dl-material"')}
+      ${field("表面 / 熱處理", "finish", i.finish, 'list="dl-finish"')}
+      ${field("規格 / 尺寸", "spec", i.spec)}
       ${field("單位", "unit", i.unit)}
+      ${field("單件工時（分鐘）", "cycle_min", i.cycle_min || "", 'type="number" step="any" min="0" placeholder="用來估機台負荷"')}
       ${field("安全庫存（低於會提醒）", "safety_stock", i.safety_stock ?? 0, 'type="number" step="any" min="0"')}
       ${field("成本單價", "cost", i.cost ?? 0, 'type="number" step="any" min="0"')}
       ${field("售價", "price", i.price ?? 0, 'type="number" step="any" min="0"')}
       ${field("儲位", "location", i.location)}
       ${item ? "" : field("期初庫存", "opening_stock", 0, 'type="number" step="any" min="0"')}
       ${field("備註", "note", i.note, "", true)}
-    </div>
+    </div>${datalist("dl-material", MATERIALS)}${datalist("dl-finish", FINISHES)}
     ${item ? '<div class="actions" style="justify-content:flex-start"><button type="button" class="small danger" id="del">停用此品項</button></div>' : ""}`,
     onOpen: () => {
       const del = $("#del");
@@ -239,7 +443,7 @@ function stockCount(item) {
     title: `盤點：${item.code} ${item.name}`,
     body: `<p>系統庫存：<b>${n(item.stock)} ${esc(item.unit)}</b>。請輸入實際點到的數量，系統會自動記錄差異。</p>
       <div class="fields">
-        ${field("實盤數量 *", "actual", item.stock, 'type="number" step="any" min="0" required')}
+        ${field("實盤數量 *", "actual", item.stock, 'type="number" step="any" required')}
         ${field("原因 / 備註", "note", "")}
       </div>`,
     ok: "確認盤點",
@@ -253,36 +457,133 @@ function stockCount(item) {
 
 // ---------------------------------------------------------------- 客戶 / 廠商
 
-views.partners = async () => {
-  const list = await api("GET", "/api/partners");
-  const section = (type, title) => `<div class="card"><h3>${title}</h3>${table(
-    ["名稱", "聯絡人", "電話", "統編", ""],
-    list.filter((p) => p.type === type).map((p) => `<tr class="clickable" data-partner="${p.id}">
-      <td>${esc(p.name)}</td><td>${esc(p.contact)}</td>
-      <td>${esc(p.phone)}</td><td>${esc(p.tax_id)}</td>
-      <td><button class="small ghost" data-edit="${p.id}">編輯</button></td></tr>`))}</div>`;
+const PTYPE = { customer: "客戶", supplier: "供應商" };
+const partnersState = () => views.partners.state || (views.partners.state = {
+  type: "customer", search: "", grp: "", sort: "last_date", dir: "desc" });
+
+views.partners = async (typeArg) => {
+  const st = partnersState();
+  if (typeArg && PTYPE[typeArg]) st.type = typeArg;
+  const all = await api("GET", "/api/partners?stats=1");
+  const counts = { customer: 0, supplier: 0 };
+  all.forEach((p) => counts[p.type]++);
+  const mine = all.filter((p) => p.type === st.type);
+  const groups = [...new Set(mine.map((p) => p.grp).filter(Boolean))].sort();
+  const words = st.search.toLowerCase().split(/\s+/).filter(Boolean);
+  let list = mine.filter((p) => (!st.grp || (st.grp === "-" ? !p.grp : p.grp === st.grp))
+    && words.every((w) => [p.name, p.short_name, p.contact, p.phone, p.tax_id, p.address, p.grp, p.note]
+      .some((v) => String(v || "").toLowerCase().includes(w))));
+  const key = st.sort;
+  list.sort((a, b) => {
+    let x = a[key] ?? "", y = b[key] ?? "";
+    if (key === "name") { x = pname(a); y = pname(b); return st.dir === "asc" ? x.localeCompare(y, "zh-TW") : y.localeCompare(x, "zh-TW"); }
+    return (x < y ? -1 : x > y ? 1 : 0) * (st.dir === "asc" ? 1 : -1);
+  });
+  const year = today().slice(0, 4);
+  const sortHead = (k, label, cls = "") => {
+    const on = st.sort === k;
+    return [`<a class="sort ${on ? "on" : ""}" data-sort="${k}">${label}${on ? (st.dir === "asc" ? " ▲" : " ▼") : ""}</a>`, cls];
+  };
+  const old = (d) => d && d < new Date(Date.now() - 365 * 86400000).toLocaleDateString("sv-SE");
   app.innerHTML = `
-    <h1>客戶 / 廠商 <span class="spacer"></span>
-      <button id="add-c">＋ 新增客戶</button><button id="add-s" class="ghost">＋ 新增供應商</button></h1>
-    ${section("customer", "客戶")}${section("supplier", "供應商")}`;
-  $("#add-c").onclick = () => partnerForm({ type: "customer" });
-  $("#add-s").onclick = () => partnerForm({ type: "supplier" });
-  const byId = Object.fromEntries(list.map((p) => [p.id, p]));
-  $$("[data-edit]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); partnerForm(byId[b.dataset.edit]); }));
-  $$("[data-partner]").forEach((tr) => (tr.onclick = () => go("partner:" + tr.dataset.partner)));
+    <h1>客戶 / 廠商 <span class="spacer"></span><button id="add">＋ 新增${PTYPE[st.type]}</button></h1>
+    <div class="tabs">
+      ${Object.entries(PTYPE).map(([t, label]) => `<a class="tab ${t === st.type ? "on" : ""}" data-tab="${t}">${label} <span class="count">${counts[t]}</span></a>`).join("")}
+    </div>
+    <div class="toolbar">
+      <input id="p-search" placeholder="搜尋名稱、簡稱、電話、統編、聯絡人、地址" value="${esc(st.search)}" style="flex:1;min-width:220px">
+    </div>
+    <div class="chips">
+      <a class="chip ${!st.grp ? "on" : ""}" data-grp="">全部 ${mine.length}</a>
+      ${groups.map((g) => `<a class="chip ${st.grp === g ? "on" : ""}" data-grp="${esc(g)}">${esc(g)} ${mine.filter((p) => p.grp === g).length}</a>`).join("")}
+      <a class="chip ${st.grp === "-" ? "on" : ""}" data-grp="-">未分類 ${mine.filter((p) => !p.grp).length}</a>
+    </div>
+    <div class="batch" id="batch" hidden>
+      <b id="b-count"></b>
+      <input id="b-grp" list="dl-grp" placeholder="分類名稱，例：A級客戶、汽車零件、外包熱處理" style="width:260px;min-width:0">
+      <button type="button" class="small" id="b-set">設定分類</button>
+      <button type="button" class="small ghost" id="b-move">改為${st.type === "customer" ? "供應商" : "客戶"}</button>
+      <button type="button" class="small ghost" id="b-lookup">🔍 補齊公司登記資料</button>
+      ${datalist("dl-grp", groups)}
+    </div>
+    <div class="card">${table([
+      `<input type="checkbox" id="check-all" title="全選">`, sortHead("name", "名稱"), "分類", "電話", "聯絡人",
+      sortHead("last_date", "最近往來"), sortHead("amount_year", year + " 年", "num"),
+      sortHead("amount_last_year", (year - 1) + " 年", "num"), sortHead("amount_total", "累計", "num")],
+      list.map((p) => `<tr class="clickable" data-partner="${p.id}">
+        <td><input type="checkbox" class="pick" value="${p.id}"></td>
+        <td><b>${esc(pname(p))}</b>${p.short_name && p.short_name !== p.name ? `<div class="muted small">${esc(p.name)}</div>` : ""}
+          ${p.reg_status && !/核准設立|核准登記/.test(p.reg_status) ? `<span class="tag danger">${esc(p.reg_status)}</span>` : ""}</td>
+        <td>${p.grp ? `<span class="tag">${esc(p.grp)}</span>` : ""}</td>
+        <td>${esc(p.phone)}</td><td>${esc(p.contact)}</td>
+        <td>${esc(p.last_date || "")}${old(p.last_date) ? ' <span class="tag warn">久未往來</span>' : ""}</td>
+        <td class="num">${p.amount_year ? money(p.amount_year) : ""}</td>
+        <td class="num">${p.amount_last_year ? money(p.amount_last_year) : ""}</td>
+        <td class="num">${p.amount_total ? money(p.amount_total) : ""}</td></tr>`),
+      st.search || st.grp ? "沒有符合條件的資料" : `還沒有${PTYPE[st.type]}`)}</div>`;
+
+  $$("[data-tab]").forEach((a) => (a.onclick = () => { st.type = a.dataset.tab; st.grp = ""; go("partners:" + st.type); }));
+  $$("[data-grp]").forEach((a) => (a.onclick = () => { st.grp = a.dataset.grp; refresh(); }));
+  let timer;
+  $("#p-search").oninput = (e) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { st.search = e.target.value; refresh(); }, 300);
+  };
+  if (st.search) { $("#p-search").focus(); $("#p-search").setSelectionRange(st.search.length, st.search.length); }
+  $$("[data-sort]").forEach((a) => (a.onclick = () => {
+    const k = a.dataset.sort;
+    st.dir = st.sort === k ? (st.dir === "asc" ? "desc" : "asc") : (k === "name" ? "asc" : "desc");
+    st.sort = k;
+    refresh();
+  }));
+  $("#add").onclick = () => partnerForm({ type: st.type });
+  $$("[data-partner]").forEach((tr) => (tr.onclick = (e) => {
+    if (e.target.classList.contains("pick")) return;
+    go("partner:" + tr.dataset.partner);
+  }));
+
+  const picked = () => $$(".pick:checked").map((c) => Number(c.value));
+  const syncBatch = () => {
+    const k = picked().length;
+    $("#batch").hidden = !k;
+    $("#b-count").textContent = `已選 ${k} 家：`;
+  };
+  $$(".pick").forEach((c) => (c.onchange = syncBatch));
+  $("#check-all").onclick = (e) => { e.stopPropagation(); $$(".pick").forEach((c) => (c.checked = e.target.checked)); syncBatch(); };
+  $("#b-set").onclick = async () => {
+    await api("POST", "/api/partners/batch", { ids: picked(), set: { grp: $("#b-grp").value } });
+    toast($("#b-grp").value ? `已設定分類「${$("#b-grp").value}」` : "已清除分類");
+    refresh();
+  };
+  $("#b-move").onclick = async () => {
+    const to = st.type === "customer" ? "supplier" : "customer";
+    if (!confirm(`把勾選的 ${picked().length} 家改為${PTYPE[to]}？`)) return;
+    await api("POST", "/api/partners/batch", { ids: picked(), set: { type: to } });
+    customerCache = null;
+    toast("已移動");
+    refresh();
+  };
+  $("#b-lookup").onclick = () => batchLookup(mine.filter((p) => picked().includes(p.id)));
 };
 
 // 單一客戶 / 廠商：基本資料 + 所有往來紀錄（舊系統 + 本系統）
 views.partner = async (id) => {
   const { partner: p, stats, history } = await api("GET", `/api/partners/${id}/summary`);
   const isCus = p.type === "customer";
+  const info = (label, v) => `<div><span>${label}</span>${esc(v || "—")}</div>`;
+  const regBad = p.reg_status && !/核准設立|核准登記/.test(p.reg_status);
   app.innerHTML = `
-    <h1><a class="muted" style="cursor:pointer" id="back">客戶/廠商</a> › ${esc(p.name)}
-      <span class="spacer"></span><button class="ghost" id="edit">編輯資料</button>
-      ${isCus ? '<button id="new-order">＋ 開新訂單</button>' : '<button id="new-order">＋ 開採購單</button>'}</h1>
+    <h1><a class="muted" style="cursor:pointer" id="back">${PTYPE[p.type]}</a> › ${esc(p.name)}
+      ${p.grp ? `<span class="tag">${esc(p.grp)}</span>` : ""}
+      <span class="spacer"></span><button class="ghost" id="lookup">🔍 查公司登記</button>
+      <button class="ghost" id="edit">編輯資料</button>
+      <button id="new-order">＋ ${isCus ? "開新訂單" : "開採購單"}</button></h1>
+    ${regBad ? `<div class="card" style="background:var(--danger-bg)">⚠️ 經濟部登記狀態：<b>${esc(p.reg_status)}</b>，交易前請確認。</div>` : ""}
     <div class="card"><div class="detail-head">
-      <div><span>聯絡人</span>${esc(p.contact || "—")}</div><div><span>電話</span>${esc(p.phone || "—")}</div>
-      <div><span>統編</span>${esc(p.tax_id || "—")}</div><div><span>地址</span>${esc(p.address || "—")}</div>
+      ${info("簡稱", p.short_name)}${info("聯絡人", p.contact)}${info("電話", p.phone)}${info("傳真", p.fax)}
+      ${info("Email", p.email)}${info("統編", p.tax_id)}${info("負責人", p.owner)}${info("地址", p.address)}
+      ${p.reg_checked ? `<div style="grid-column:1/-1"><span>登記資料</span>${esc(p.reg_status)}　資本額 ${esc(p.reg_capital || "—")}　設立 ${esc(p.reg_date || "—")}
+        <span class="muted">（${esc(p.reg_checked)} 查詢）</span></div>` : ""}
       ${p.note ? `<div style="grid-column:1/-1"><span>備註</span>${esc(p.note)}</div>` : ""}</div></div>
     <div class="kpis">
       <div class="kpi"><div class="label">往來期間</div><div class="value" style="font-size:18px">
@@ -303,8 +604,9 @@ views.partner = async (id) => {
     </div>
     <div class="card"><h3>全部往來明細 <span class="muted" style="font-weight:400">（最近 ${history.rows.length} 筆，共 ${n(history.count)} 筆）</span></h3>
       ${historyTable(history.rows, false)}</div>`;
-  $("#back").onclick = () => go("partners");
+  $("#back").onclick = () => go("partners:" + p.type);
   $("#edit").onclick = () => partnerForm(p);
+  $("#lookup").onclick = () => lookupPartner(p);
   $("#new-order").onclick = () => orderForm(isCus ? "sales" : "purchase", null, p.id);
   $$("[data-search]").forEach((tr) => (tr.onclick = () => {
     views.history.state = { search: tr.dataset.search, kind: "", date_from: "", date_to: "" };
@@ -312,6 +614,78 @@ views.partner = async (id) => {
   }));
   wireHistoryLinks();
 };
+
+// ---- 經濟部商工登記查詢
+
+const REG_FIELDS = [["name", "name", "公司名稱"], ["owner", "owner", "負責人"], ["address", "address", "地址"]];
+
+async function lookupPartner(p) {
+  const taxId = p.tax_id || prompt(`「${p.name}」還沒有統一編號，請輸入 8 碼統編：`) || "";
+  if (!taxId) return;
+  let r;
+  try {
+    r = await api("GET", "/api/company-lookup?tax_id=" + encodeURIComponent(taxId));
+  } catch (e) {
+    return alert(e.message);
+  }
+  if (!r.found) {
+    return modal({
+      title: "查不到登記資料", hideOk: true,
+      body: `<p>統編 ${esc(r.tax_id)} 沒有查到資料，或目前連不上經濟部的系統。</p>
+        ${r.errors && r.errors.length ? `<p class="muted">${r.errors.map(esc).join("<br>")}</p>` : ""}
+        <p>可以到經濟部「商工登記公示資料查詢」網站手動查詢：<br>
+          <a href="${esc(r.manual_url)}" target="_blank" rel="noopener">${esc(r.manual_url)}</a></p>`,
+    });
+  }
+  const bad = r.status && !/核准設立|核准登記/.test(r.status);
+  modal({
+    title: `經濟部登記資料（${esc(r.kind)}）`,
+    ok: "套用勾選的資料",
+    body: `${bad ? `<p class="error" style="font-size:16px">⚠️ 登記狀態：${esc(r.status)}</p>` : ""}
+      <p class="muted">勾選要更新的欄位。登記狀態、資本額、設立日期會一起記錄下來。</p>
+      ${table(["", "欄位", "系統裡現在", "經濟部登記"], REG_FIELDS.map(([k, rk, label]) => {
+        const cur = p[k] || "", val = r[rk] || "";
+        const same = cur.replace(/\s/g, "") === val.replace(/\s/g, "");
+        return `<tr><td><input type="checkbox" name="use_${k}" ${!cur && val ? "checked" : ""} ${!val || same ? "disabled" : ""}></td>
+          <td>${label}</td><td>${esc(cur || "—")}</td><td>${esc(val || "—")}${same ? ' <span class="muted">（相同）</span>' : ""}</td></tr>`;
+      }))}
+      <div class="detail-head" style="margin-top:12px">
+        <div><span>統編</span>${esc(r.tax_id)}</div><div><span>狀態</span>${esc(r.status || "—")}</div>
+        <div><span>資本額</span>${esc(r.capital || "—")}</div><div><span>設立日期</span>${esc(r.setup_date || "—")}</div>
+      </div>`,
+    onSubmit: async (form) => {
+      const body = { tax_id: r.tax_id, reg_status: r.status, reg_capital: r.capital, reg_date: r.setup_date, reg_checked: today() };
+      REG_FIELDS.forEach(([k, rk]) => { if (form.elements["use_" + k]?.checked) body[k] = r[rk]; });
+      await api("PUT", "/api/partners/" + p.id, body);
+      toast("已更新公司資料");
+      refresh();
+    },
+  });
+}
+
+async function batchLookup(list) {
+  const todo = list.filter((p) => /^\d{8}$/.test((p.tax_id || "").replace(/\D/g, "")));
+  if (!todo.length) return alert("勾選的對象都沒有 8 碼統一編號，無法查詢。");
+  if (!confirm(`查詢 ${todo.length} 家的經濟部登記資料？\n（只會補上空白的負責人、地址，並記錄登記狀態；${list.length - todo.length} 家沒有統編會略過）`)) return;
+  let ok = 0, miss = 0, bad = [];
+  for (const [k, p] of todo.entries()) {
+    toast(`查詢中 ${k + 1} / ${todo.length}：${pname(p)}`);
+    try {
+      const r = await api("GET", "/api/company-lookup?tax_id=" + p.tax_id);
+      if (!r.found) { miss++; continue; }
+      const body = { reg_status: r.status, reg_capital: r.capital, reg_date: r.setup_date, reg_checked: today() };
+      if (!p.owner && r.owner) body.owner = r.owner;
+      if (!p.address && r.address) body.address = r.address;
+      await api("PUT", "/api/partners/" + p.id, body);
+      ok++;
+      if (r.status && !/核准設立|核准登記/.test(r.status)) bad.push(`${pname(p)}：${r.status}`);
+    } catch (e) {
+      miss++;
+    }
+  }
+  alert(`完成：更新 ${ok} 家，查不到 ${miss} 家。` + (bad.length ? `\n\n⚠️ 登記狀態異常：\n${bad.join("\n")}` : ""));
+  refresh();
+}
 
 function historyTable(list, showPartner = true) {
   return table(
@@ -359,26 +733,86 @@ views.history = async () => {
   wireHistoryLinks();
 };
 
-function partnerForm(p) {
-  const label = p.type === "customer" ? "客戶" : "供應商";
+async function partnerForm(p) {
+  const all = await api("GET", "/api/partners");
+  const groups = [...new Set(all.map((x) => x.grp).filter(Boolean))].sort();
   modal({
-    title: (p.id ? "編輯" : "新增") + label,
+    title: p.id ? `編輯 ${p.name}` : "新增" + PTYPE[p.type],
     body: `<div class="fields">
-      <input type="hidden" name="type" value="${p.type}">
-      ${field("名稱 *", "name", p.name, "required")}
+      ${selectField("類型", "type", Object.entries(PTYPE), p.type)}
+      ${field("名稱（全名）*", "name", p.name, "required")}
+      ${field("簡稱", "short_name", p.short_name, 'placeholder="平常叫的名字"')}
+      ${field("分類", "grp", p.grp, 'list="dl-pgrp" placeholder="例：A級客戶、汽車零件、外包熱處理"')}
       ${field("聯絡人", "contact", p.contact)}
       ${field("電話", "phone", p.phone)}
-      ${field("統一編號", "tax_id", p.tax_id)}
+      ${field("傳真", "fax", p.fax)}
+      ${field("Email", "email", p.email)}
+      ${field("負責人", "owner", p.owner)}
+      <label>統一編號<span style="display:flex;gap:6px"><input name="tax_id" value="${esc(p.tax_id || "")}">
+        <button type="button" class="small ghost" id="pf-lookup" title="用統編查經濟部登記資料">查詢</button></span></label>
       ${field("地址", "address", p.address, "", true)}
       ${field("備註（付款條件、交貨習慣…）", "note", p.note, "", true)}
-    </div>`,
+    </div>${datalist("dl-pgrp", groups)}`,
+    onOpen: (form) => {
+      $("#pf-lookup").onclick = async () => {
+        const tax = form.elements.tax_id.value.trim();
+        if (!tax) return ($("#modal-error").textContent = "請先輸入統一編號");
+        $("#modal-error").textContent = "查詢中…";
+        try {
+          const r = await api("GET", "/api/company-lookup?tax_id=" + encodeURIComponent(tax));
+          if (!r.found) {
+            $("#modal-error").innerHTML = `查不到資料或無法連線。可到 <a href="${esc(r.manual_url)}" target="_blank" rel="noopener">經濟部商工登記查詢</a> 手動查。`;
+            return;
+          }
+          const el = form.elements;
+          if (!el.name.value) el.name.value = r.name;
+          if (!el.owner.value) el.owner.value = r.owner;
+          if (!el.address.value) el.address.value = r.address;
+          form.dataset.reg = JSON.stringify({ reg_status: r.status, reg_capital: r.capital, reg_date: r.setup_date, reg_checked: today() });
+          $("#modal-error").textContent = "";
+          toast(`查到：${r.name}（${r.status || "狀態不明"}），已補上空白欄位`);
+        } catch (e) {
+          $("#modal-error").textContent = e.message;
+        }
+      };
+    },
     onSubmit: async (form) => {
-      if (p.id) await api("PUT", "/api/partners/" + p.id, formData(form));
-      else await api("POST", "/api/partners", formData(form));
+      const data = { ...formData(form), ...(form.dataset.reg ? JSON.parse(form.dataset.reg) : {}) };
+      delete form.dataset.reg;
+      if (p.id) await api("PUT", "/api/partners/" + p.id, data);
+      else await api("POST", "/api/partners", data);
+      customerCache = null;
       toast("已儲存");
       refresh();
     },
   });
+}
+
+// ---- 品項挑選：品項上千筆時下拉選單不好用，改成「打字搜尋」（料號 / 品名 / 圖號都可以）
+
+const itemLabel = (i) => [i.code, i.name, i.drawing_no].filter(Boolean).join("｜");
+
+function itemDatalistHtml(id, items) {
+  return `<datalist id="${id}">${items.map((i) =>
+    `<option value="${esc(itemLabel(i))}">${i.stock != null ? `庫存 ${n(i.stock)}` : ""}</option>`).join("")}</datalist>`;
+}
+
+function itemPicker(name, listId, items, selectedId, placeholder = "打料號、品名或圖號搜尋") {
+  const sel = items.find((i) => String(i.id) === String(selectedId));
+  return `<input class="ipick" list="${listId}" value="${esc(sel ? itemLabel(sel) : "")}" placeholder="${placeholder}" autocomplete="off">
+    <input type="hidden" name="${name}" value="${sel ? sel.id : ""}">`;
+}
+
+// 依輸入內容找出品項：完整標籤 → 料號完全相同 → 圖號完全相同
+function resolvePick(input, items) {
+  const v = input.value.trim();
+  const code = v.split("｜")[0];
+  const it = items.find((i) => itemLabel(i) === v) || items.find((i) => i.code === code)
+    || (v && items.find((i) => i.drawing_no && i.drawing_no === v));
+  input.nextElementSibling.value = it ? it.id : "";
+  input.classList.toggle("invalid", !!v && !it);
+  if (it && input.value !== itemLabel(it)) input.value = itemLabel(it);
+  return it || null;
 }
 
 // ---------------------------------------------------------------- 訂單（銷貨 / 採購共用）
@@ -421,14 +855,12 @@ views.purchase = orderListView("purchase");
 async function orderForm(kind, order, presetPartner) {
   const k = KIND[kind];
   const [partners, items] = await Promise.all([
-    api("GET", "/api/partners?type=" + k.ptype), api("GET", "/api/items")]);
+    api("GET", "/api/partners?type=" + k.ptype), api("GET", "/api/items?lite=1")]);
   if (!partners.length) return alert(`請先到「客戶/廠商」新增${k.partner}`);
   if (!items.length) return alert("請先到「庫存品項」新增品項");
   const o = order || { order_date: today(), lines: [{}], partner_id: presetPartner };
-  const itemOpts = (sel) => `<option value="">— 選擇品項 —</option>` + items.map((i) =>
-    `<option value="${i.id}" ${String(i.id) === String(sel) ? "selected" : ""}>${esc(i.code)} ${esc(i.name)}（庫存 ${n(i.stock)}）</option>`).join("");
   const lineRow = (l = {}) => `<tr>
-      <td style="min-width:220px"><select name="item_id">${itemOpts(l.item_id)}</select><div class="hint muted"></div></td>
+      <td style="min-width:260px">${itemPicker("item_id", "dl-order-items", items, l.item_id)}<div class="hint muted"></div></td>
       <td><input name="qty" type="number" step="any" min="0" value="${l.qty ?? ""}" placeholder="數量"></td>
       <td><input name="unit_price" type="number" step="any" min="0" value="${l.unit_price ?? ""}" placeholder="單價"></td>
       <td class="num sub"></td>
@@ -437,7 +869,7 @@ async function orderForm(kind, order, presetPartner) {
   modal({
     title: (order ? "修改 " + order.no : "新增" + (kind === "sales" ? "銷貨訂單" : "採購單")),
     body: `<div class="fields">
-        ${selectField(k.partner + " *", "partner_id", [["", "— 請選擇 —"], ...partners.map((p) => [p.id, p.name])], o.partner_id)}
+        ${selectField(k.partner + " *", "partner_id", [["", "— 請選擇 —"], ...partners.map((p) => [p.id, pname(p)])], o.partner_id)}
         ${field("下單日期", "order_date", o.order_date, 'type="date"')}
         ${field(k.due, "due_date", o.due_date, 'type="date"')}
         ${kind === "sales" ? field("客戶訂單號 / 圖號", "customer_po", o.customer_po) : ""}
@@ -446,14 +878,13 @@ async function orderForm(kind, order, presetPartner) {
       <h3 style="margin-top:16px">明細</h3>
       ${lockedLines ? '<p class="muted">已有交貨紀錄，明細不能修改。</p>' : `
       <div class="table-wrap"><table class="lines"><thead><tr><th>品項</th><th>數量</th><th>單價</th><th class="num">小計</th><th></th></tr></thead>
-        <tbody id="lines">${o.lines.map(lineRow).join("")}</tbody></table></div>
+        <tbody id="lines">${o.lines.map(lineRow).join("")}</tbody></table></div>${itemDatalistHtml("dl-order-items", items)}
       <div class="actions" style="justify-content:space-between">
         <button type="button" class="small ghost" id="add-line">＋ 加一行</button>
         <b id="total"></b></div>`}`,
     onOpen: () => {
       if (lockedLines) return;
       const body = $("#lines");
-      const byId = Object.fromEntries(items.map((i) => [i.id, i]));
       const recalc = () => {
         let total = 0;
         $$("tr", body).forEach((tr) => {
@@ -466,8 +897,8 @@ async function orderForm(kind, order, presetPartner) {
       const wire = () => {
         $$("tr", body).forEach((tr) => {
           $(".rm", tr).onclick = () => { if ($$("tr", body).length > 1) tr.remove(); recalc(); };
-          $("[name=item_id]", tr).onchange = async (e) => {
-            const it = byId[e.target.value];
+          $(".ipick", tr).onchange = async (e) => {
+            const it = resolvePick(e.target, items);
             const price = $("[name=unit_price]", tr);
             const hint = $(".hint", tr);
             hint.textContent = "";
@@ -494,6 +925,7 @@ async function orderForm(kind, order, presetPartner) {
       const data = formData(form);
       delete data.item_id; delete data.qty; delete data.unit_price;
       if (!lockedLines) {
+        $$("#lines .ipick").forEach((inp) => resolvePick(inp, items));
         data.lines = $$("#lines tr").map((tr) => ({
           item_id: $("[name=item_id]", tr).value, qty: $("[name=qty]", tr).value,
           unit_price: $("[name=unit_price]", tr).value,
@@ -636,37 +1068,43 @@ views.workorders = async () => {
 };
 
 async function workOrderForm(pre = {}) {
-  const [items, sales] = await Promise.all([api("GET", "/api/items"), api("GET", "/api/orders?kind=sales")]);
+  const [items, sales] = await Promise.all([api("GET", "/api/items?lite=1"), api("GET", "/api/orders?kind=sales")]);
   const openSales = sales.filter((o) => ["open", "partial"].includes(o.status));
   const products = items.filter((i) => ["成品", "半成品"].includes(i.category));
   const materials = items.filter((i) => !["成品"].includes(i.category));
-  const matRow = () => `<tr><td style="min-width:240px"><select name="mat_id"><option value="">— 選擇材料 —</option>
-      ${materials.map((i) => `<option value="${i.id}">${esc(i.code)} ${esc(i.name)} ${esc(i.spec)}（庫存 ${n(i.stock)} ${esc(i.unit)}）</option>`).join("")}
-    </select></td><td><input name="per" type="number" step="any" min="0" placeholder="每件用量"></td>
+  const machines = [...new Set((await api("GET", "/api/workorders")).map((w) => w.machine).filter(Boolean))].sort();
+  const matRow = () => `<tr><td style="min-width:260px">${itemPicker("mat_id", "dl-mats", materials, "", "打材料料號或名稱")}</td>
+    <td><input name="per" type="number" step="any" min="0" placeholder="每件用量"></td>
     <td><button type="button" class="small ghost rm">✕</button></td></tr>`;
   modal({
     title: "開立生產工單",
     body: `<div class="fields">
-        ${selectField("生產品項 *", "item_id", [["", "— 請選擇成品 —"], ...products.map((i) => [i.id, `${i.code} ${i.name}`])], pre.item_id)}
+        <label>生產品項 *${itemPicker("item_id", "dl-products", products, pre.item_id, "打料號、品名或圖號搜尋")}</label>
         ${field("生產數量 *", "qty", pre.qty ?? "", 'type="number" step="any" min="0" required')}
         ${selectField("對應訂單", "sales_order_id", [["", "（庫存備貨，不對應訂單）"],
           ...openSales.map((o) => [o.id, `${o.no} ${o.partner_name}`])], pre.sales_order_id)}
-        ${field("機台", "machine", "", 'placeholder="例：CNC-02 車床"')}
+        ${field("機台", "machine", "", 'placeholder="例：CNC-02 車床" list="dl-machines"')}
         ${field("交期", "due_date", pre.due_date || "", 'type="date"')}
         ${field("備註（圖號、加工注意事項）", "note", "", "", true)}
       </div>
       <h3 style="margin-top:16px">用料（完工時自動扣庫存）</h3>
       <p class="muted" style="margin-top:0">例：一支 3 米棒料可做 20 件 → 每件用量填 0.05</p>
       <table class="lines"><tbody id="mats">${matRow()}</tbody></table>
-      <button type="button" class="small ghost" id="add-mat">＋ 加材料</button>`,
+      <button type="button" class="small ghost" id="add-mat">＋ 加材料</button>
+      ${itemDatalistHtml("dl-products", products)}${itemDatalistHtml("dl-mats", materials)}${datalist("dl-machines", machines)}`,
     onOpen: () => {
+      const wirePick = (root, list) => $$(".ipick", root).forEach((inp) => (inp.onchange = () => resolvePick(inp, list)));
+      wirePick($("#modal-body .fields"), products);
+      wirePick($("#mats"), materials);
       const wire = () => $$("#mats .rm").forEach((b) => (b.onclick = () => b.closest("tr").remove()));
-      $("#add-mat").onclick = () => { $("#mats").insertAdjacentHTML("beforeend", matRow()); wire(); };
+      $("#add-mat").onclick = () => { $("#mats").insertAdjacentHTML("beforeend", matRow()); wire(); wirePick($("#mats"), materials); };
       wire();
       if (!products.length) $("#modal-error").textContent = "還沒有分類為「成品」的品項，請先到庫存品項新增。";
     },
     onSubmit: async (form) => {
+      $$(".ipick", form).forEach((inp) => resolvePick(inp, inp.list && inp.list.id === "dl-products" ? products : materials));
       const data = formData(form);
+      if (!data.item_id) throw new Error("請選擇要生產的品項（從清單點選）");
       data.materials = $$("#mats tr").map((tr) => ({
         item_id: $("[name=mat_id]", tr).value, qty_per_unit: $("[name=per]", tr).value || 0,
       })).filter((m) => m.item_id);
@@ -738,17 +1176,21 @@ async function showWorkOrder(id) {
 views.moves = async () => {
   const state = views.moves.state || (views.moves.state = { item_id: "" });
   const [items, moves] = await Promise.all([
-    api("GET", "/api/items"), api("GET", "/api/stock/moves?" + new URLSearchParams(state))]);
+    api("GET", "/api/items?lite=1"), api("GET", "/api/stock/moves?" + new URLSearchParams(state))]);
   app.innerHTML = `
     <h1>庫存異動紀錄</h1>
-    <div class="toolbar"><select id="item"><option value="">全部品項（最近 300 筆）</option>
-      ${items.map((i) => `<option value="${i.id}" ${String(i.id) === String(state.item_id) ? "selected" : ""}>
-        ${esc(i.code)} ${esc(i.name)}</option>`).join("")}</select></div>
+    <div class="toolbar" id="mv-bar">${itemPicker("item_id", "dl-mv", items, state.item_id, "全部品項（最近 300 筆）；打料號篩選")}
+      ${state.item_id ? '<button type="button" class="small ghost" id="mv-all">看全部</button>' : ""}</div>
+    ${itemDatalistHtml("dl-mv", items)}
     <div class="card">${table(["日期", "品項", "類型", ["數量", "num"], "單據", "備註"],
       moves.map((m) => `<tr><td>${esc(m.move_date)}</td><td>${esc(m.code)} ${esc(m.name)}</td><td>${esc(m.kind)}</td>
         <td class="num" style="color:${m.qty < 0 ? "var(--danger)" : "var(--ok)"}">${m.qty > 0 ? "+" : ""}${n(m.qty)} ${esc(m.unit)}</td>
         <td>${esc(m.ref)}</td><td>${esc(m.note)}</td></tr>`))}</div>`;
-  $("#item").onchange = (e) => { state.item_id = e.target.value; refresh(); };
+  $("#mv-bar .ipick").onchange = (e) => {
+    const it = resolvePick(e.target, items);
+    if (it) { state.item_id = it.id; refresh(); }
+  };
+  if ($("#mv-all")) $("#mv-all").onclick = () => { state.item_id = ""; refresh(); };
 };
 
 // ---------------------------------------------------------------- 備份 / 匯出

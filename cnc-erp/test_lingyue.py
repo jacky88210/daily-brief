@@ -208,7 +208,8 @@ class LingyueTest(unittest.TestCase):
         self.assertEqual(s["partners"]["supplier"]["created"], 1)
         yf = self.conn.execute("SELECT * FROM partners WHERE name = '永豐機械股份有限公司'").fetchone()
         self.assertEqual((yf["type"], yf["tax_id"], yf["contact"]), ("customer", "12345678", "王經理"))
-        for part in ("C001", "簡稱 永豐", "傳真 04-25678902", "月結60天"):
+        self.assertEqual((yf["short_name"], yf["fax"], yf["email"]), ("永豐", "04-25678902", "wang@example.com"))
+        for part in ("C001", "月結60天"):
             self.assertIn(part, yf["note"])
 
         def item(code):
