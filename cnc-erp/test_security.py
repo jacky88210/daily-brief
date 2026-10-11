@@ -94,6 +94,29 @@ class BackupTest(Base):
             server.run_backup_now(self.conn, {})
 
 
+class BackupAlertTest(Base):
+    def test_alerts(self):
+        self.assertIn("還沒有設定自動備份", server.backup_alerts(self.conn)[0])
+        ok = os.path.join(self.dir, "ok")
+        os.makedirs(ok)
+        server.save_settings(self.conn, {"backup_dir": ok})
+        self.conn.commit()
+        self.assertTrue(any("只設定了一個" in a for a in server.backup_alerts(self.conn)))
+        server.backup_to_dir()
+        self.assertEqual([a for a in server.backup_alerts(self.conn) if "只設定了一個" not in a], [])
+        # 狀態從正常變失敗才記一筆；一直失敗不會重複記
+        shutil.rmtree(ok)
+        for _ in range(3):
+            server.backup_to_dir(force=True)
+        log = [r["action"] for r in server.list_audit(self.conn, {})]
+        self.assertEqual(log.count("自動備份失敗"), 1)
+        self.assertTrue(any("失敗" in a for a in server.backup_alerts(self.conn)))
+        os.makedirs(ok)
+        server.backup_to_dir(force=True)
+        self.assertIn("自動備份恢復正常", [r["action"] for r in server.list_audit(self.conn, {})])
+        self.assertIn("backup_alerts", server.dashboard(self.conn, {}))
+
+
 class AccessTest(Base):
     def start(self, host):
         srv = ThreadingHTTPServer((host, 0), server.Handler)

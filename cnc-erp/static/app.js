@@ -286,6 +286,9 @@ views.dashboard = async () => {
   const daysAgo = (iso) => Math.round((new Date(d.today) - new Date(iso)) / 86400000);
   app.innerHTML = `
     <h1>今日總覽 <span class="muted" style="font-size:16px;font-weight:400">${d.today}</span></h1>
+    ${d.backup_alerts.length ? `<div class="card" style="background:var(--danger-bg);border-color:var(--danger)">
+      <b>🛡️ 備份需要注意</b><ul style="margin:6px 0">${d.backup_alerts.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+      <a class="plink" href="#tools">到「設定」處理 →</a></div>` : ""}
     <div class="kpis">
       <div class="kpi"><div class="label">本月銷貨</div><div class="value">${money(thisMonth.amount)}</div>
         <div class="sub">去年同月 ${money(thisMonth.last_year)} ${pct(thisMonth.amount, thisMonth.last_year)}</div></div>

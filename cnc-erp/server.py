@@ -1071,6 +1071,7 @@ def dashboard(conn, q):
         cyc = conn.execute("SELECT cycle_min FROM items WHERE id = ?", (w["item_id"],)).fetchone()[0] or 0
         w["est_hours"] = round(cyc * w["qty"] / 60, 1) if cyc else None
     extra = dashboard_trends(conn, t)
+    extra["backup_alerts"] = backup_alerts(conn)
     return {
         **extra,
         "today": t,
@@ -1083,6 +1084,30 @@ def dashboard(conn, q):
         "month_sales": month_sales,
         "work_orders": wos,
     }
+
+
+def backup_alerts(conn):
+    """給總覽用：沒設備份、只設一處、失敗、超過 2 天沒成功 → 提醒。"""
+    dirs = [d for d in (get_setting(conn, "backup_dir"), get_setting(conn, "backup_dir2")) if d.strip()]
+    try:
+        status = json.loads(get_setting(conn, "backup_status") or "{}")
+    except ValueError:
+        status = {}
+    if not dirs:
+        return ["還沒有設定自動備份。客戶資料很重要，請到「設定」設定兩個備份位置（例：NAS + 外接硬碟）。"]
+    alerts = []
+    if len(dirs) == 1:
+        alerts.append("只設定了一個備份位置，建議再設定第二個（例：外接硬碟），NAS 故障時才有另一份。")
+    limit = _plus_days(today(), -2)
+    for d in dirs:
+        st = status.get(d.strip().strip('"'))
+        if not st:
+            alerts.append(f"{d}：還沒有備份紀錄（系統啟動後幾分鐘內會自動備份）。")
+        elif not st.get("ok"):
+            alerts.append(f"{d}：最近一次備份失敗（{st.get('time', '')}）：{st.get('error', '')}")
+        elif st.get("time", "")[:10] < limit:
+            alerts.append(f"{d}：已經超過 2 天沒有成功備份（最後一次 {st.get('time')}）。")
+    return alerts
 
 
 def dashboard_trends(conn, t):
@@ -1237,6 +1262,7 @@ def backup_to_dir(force=False):
         conn.close()
     targets = [t for t in targets if t]
     status = {k: v for k, v in status.items() if k in targets}
+    previous = {k: dict(v) for k, v in status.items()}
     name = f"cnc-backup-{today()}.zip"
     data = None
     for target in targets:
@@ -1268,8 +1294,11 @@ def backup_to_dir(force=False):
         with conn:
             set_setting(conn, "backup_status", json.dumps(status, ensure_ascii=False))
             for t, st in status.items():
-                if not st["ok"]:
+                was_ok = previous.get(t, {}).get("ok", True)
+                if not st["ok"] and was_ok:  # 只在「由正常變失敗」時記一筆，避免 NAS 沒開時每 30 分鐘記一次
                     audit(conn, "system", "自動備份失敗", f"{t}：{st['error']}")
+                elif st["ok"] and not was_ok:
+                    audit(conn, "system", "自動備份恢復正常", t)
     finally:
         conn.close()
     return status
@@ -1652,9 +1681,13 @@ def main():
         print("【警告】資料庫放在網路磁碟（NAS）上！多人同時使用時資料可能損毀。")
         print("        請把系統放在本機硬碟執行，並在「設定」開啟「自動備份到 NAS」；")
         print("        或依說明把整套系統裝在 NAS 上（Container Manager / Docker）。")
-    start_backup_thread()
     host = "0.0.0.0" if args.lan else "127.0.0.1"
-    srv = ThreadingHTTPServer((host, args.port), Handler)
+    try:
+        srv = ThreadingHTTPServer((host, args.port), Handler)
+    except OSError:
+        # 通常是系統已經在背景執行（開機自動啟動），start.bat 只要幫忙開瀏覽器就好
+        print(f"連接埠 {args.port} 已被使用：系統可能已經在執行中。")
+        sys.exit(3)
     print(f"CNC 進銷存系統已啟動：http://127.0.0.1:{args.port}  （資料庫：{DB_PATH}）")
     if args.lan:
         print("已開放區網連線，其他電腦請用這台電腦的 IP 位址加上 :%d 連線" % args.port)
@@ -1663,6 +1696,7 @@ def main():
         conn.close()
         if not has_pw:
             print("【注意】尚未設定登入密碼：其他電腦 / 手機連線時會被要求先設定密碼，設定前看不到任何資料。")
+    start_backup_thread()
     print("關閉此視窗即停止系統")
     try:
         srv.serve_forever()
