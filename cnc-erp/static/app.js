@@ -12,15 +12,107 @@ const n = (v) => Number(v || 0).toLocaleString("zh-TW", { maximumFractionDigits:
 const money = (v) => "$" + Math.round(Number(v || 0)).toLocaleString("zh-TW");
 const today = () => new Date().toLocaleDateString("sv-SE");
 
-async function api(method, path, body) {
+async function api(method, path, body, retried) {
   const res = await fetch(path, {
     method,
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.login && !retried) {
+    await showLogin();
+    return api(method, path, body, true);
+  }
   if (!res.ok) throw new Error(data.error || "發生錯誤 (" + res.status + ")");
   return data;
+}
+
+// ---- 登入：設了密碼後，從其他電腦 / 手機連線都要先登入（30 天內免重登）
+let loginWaiters = null;
+function showLogin() {
+  if (loginWaiters) return new Promise((r) => loginWaiters.push(r));
+  loginWaiters = [];
+  return new Promise((resolve) => {
+    loginWaiters.push(resolve);
+    const dlg = $("#login");
+    $("#login-error").textContent = "";
+    $("#login-pw").value = "";
+    dlg.showModal();
+    setTimeout(() => $("#login-pw").focus(), 50);
+    $("#login-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const res = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: $("#login-pw").value }) });
+      if (!res.ok) {
+        $("#login-error").textContent = "密碼不正確";
+        return;
+      }
+      dlg.close();
+      const ws = loginWaiters;
+      loginWaiters = null;
+      ws.forEach((r) => r());
+    };
+  });
+}
+
+// ---- 附件上傳：手機照片先縮到長邊 2400px（圖面還看得清楚，檔案小很多、上傳快）
+async function shrinkImage(file) {
+  if (!/^image\/(jpeg|png|webp|heic|heif)/i.test(file.type) || file.size < 1200000) return file;
+  try {
+    const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+    const scale = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext("2d").drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.88));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name.replace(/\.\w+$/, "") + ".jpg", { type: "image/jpeg" });
+  } catch (e) {
+    return file;  // 瀏覽器不支援就傳原檔
+  }
+}
+
+async function uploadFiles(ownerType, ownerId, fileList, onProgress) {
+  const out = [];
+  const files = [...fileList];
+  for (const [k, f0] of files.entries()) {
+    if (onProgress) onProgress(`上傳中 ${k + 1} / ${files.length}：${f0.name}`);
+    const f = await shrinkImage(f0);
+    const url = `/api/files/upload?owner_type=${ownerType}&owner_id=${ownerId}&name=${encodeURIComponent(f.name || "photo.jpg")}`;
+    let res = await fetch(url, { method: "POST", body: f });
+    if (res.status === 401) { await showLogin(); res = await fetch(url, { method: "POST", body: f }); }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`${f0.name}：${data.error || "上傳失敗"}`);
+    out.push(data);
+  }
+  return out;
+}
+
+const fileUrl = (f) => `/api/files/${f.id}/raw`;
+const isImage = (f) => /^image\//.test(f.mime || "");
+const FILE_ACCEPT = "image/*,application/pdf,.pdf,.dwg,.dxf,.step,.stp,.igs,.iges,.x_t,.xls,.xlsx,.doc,.docx,.zip";
+
+// 圖面縮圖列表：點圖片放大（新分頁），其他檔案顯示檔名
+function gallery(files, { deletable = false } = {}) {
+  if (!files.length) return '<p class="muted">還沒有圖面 / 附件</p>';
+  return `<div class="gallery">${files.map((f) => `<div class="gitem">
+      <a href="${fileUrl(f)}" target="_blank" rel="noopener" title="${esc(f.filename)}">
+        ${isImage(f) ? `<img src="${fileUrl(f)}" loading="lazy" alt="${esc(f.filename)}">`
+          : `<div class="fileicon">${esc((f.filename.split(".").pop() || "檔案").toUpperCase())}</div>`}
+      </a><div class="gname">${esc(f.filename)}</div>
+      ${deletable ? `<button type="button" class="small ghost gdel" data-fid="${f.id}" title="刪除">✕</button>` : ""}
+    </div>`).join("")}</div>`;
+}
+
+function wireGallery(root, after) {
+  $$(".gdel", root).forEach((b) => (b.onclick = async (e) => {
+    e.preventDefault();
+    if (!confirm("刪除這個附件？")) return;
+    await api("DELETE", "/api/files/" + b.dataset.fid);
+    toast("已刪除");
+    after();
+  }));
 }
 
 function toast(msg) {
@@ -104,9 +196,11 @@ function go(view) {
 }
 async function render() {
   const [view, arg] = decodeURIComponent(location.hash.slice(1) || "dashboard").split(":");
-  const navView = view === "partner" ? "partners" : view;
+  const navView = { partner: "partners", quote: "quotes", moves: "items" }[view] || view;
   if (view === "partners" && arg) partnersState().type = arg;
-  $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.view === navView));
+  $$("#nav a, .mobilebar a").forEach((a) => a.classList.toggle("active", a.dataset.view === navView));
+  const cur = $("#nav a.active");
+  if (cur) cur.scrollIntoView({ block: "nearest", inline: "nearest" });
   app.innerHTML = '<p class="muted">載入中…</p>';
   try {
     await (views[view] || views.dashboard)(arg);
@@ -114,7 +208,7 @@ async function render() {
     app.innerHTML = `<div class="card error">${esc(err.message)}</div>`;
   }
 }
-$$("#nav a").forEach((a) => (a.onclick = () => go(a.dataset.view)));
+$$("#nav a, .mobilebar a").forEach((a) => (a.onclick = () => (location.hash === "#" + a.dataset.view ? refresh() : go(a.dataset.view))));
 window.addEventListener("hashchange", render);
 const refresh = () => render();
 
@@ -188,6 +282,10 @@ views.dashboard = async () => {
 
     <h2 class="section">今天要處理</h2>
     <div class="grid">
+      <div class="card"><h3>📐 待報價 <span class="muted small">（近半年成交率 ${d.quotes.win_rate == null ? "—" : d.quotes.win_rate + "%"}）</span></h3>
+        ${table(["客戶", "圖號 / 品名", "詢價日", "回覆期限"], d.quotes.waiting.map((q) => `<tr class="clickable" data-quote="${q.id}">
+          <td>${esc(q.customer)}</td><td class="ellipsis">${esc(q.parts || "")}</td><td>${esc(q.inquiry_date)}</td>
+          <td class="${q.reply_by && q.reply_by < d.today ? "down" : ""}">${esc(q.reply_by || "")}</td></tr>`), "沒有待報價的圖面 👍")}</div>
       <div class="card"><h3>⚠️ 逾期未交貨</h3>
         ${table(["單號", "客戶", "交期", "狀態"], d.overdue_sales.map(orderRow), "沒有逾期訂單 👍")}</div>
       <div class="card"><h3>📅 7 天內要交貨</h3>
@@ -203,12 +301,20 @@ views.dashboard = async () => {
 
     <h2 class="section">生產現場</h2>
     <div class="grid">
+      ${d.late_work_orders.length ? `<div class="card" style="border-color:var(--danger)"><h3>🚨 預估會延誤的工單</h3>
+        ${table(["工單", "品項", "交期", "預估完成", "目前工序"], d.late_work_orders.map((w) => `<tr class="clickable" data-wo="${w.wo_id}">
+          <td>${esc(w.wo_no)}</td><td>${esc(w.item)}</td><td>${esc(w.due_date)}</td><td class="down">${esc(w.est_finish)}</td><td>${esc(w.current)}</td></tr>`))}
+        <p class="muted small" style="margin-bottom:0">到「排程」調整順序或換機台。</p></div>` : ""}
+      <div class="card"><h3>🚚 外包追蹤</h3>
+        ${table(["工單", "工序", "廠商", "送出", "預計回廠"], d.outsource.map((o) => `<tr class="clickable" data-wo="${o.wo_id}">
+          <td>${esc(o.wo_no)}</td><td>${esc(o.process)}</td><td>${esc(o.vendor || "")}</td><td>${esc(o.sent_date || "尚未送出")}</td>
+          <td class="${o.overdue ? "down" : ""}">${esc(o.expected_back || "")}${o.overdue ? " 逾期" : ""}</td></tr>`), "沒有外包中的工序")}</div>
       <div class="card"><h3>⚙️ 機台負荷（未完工工單）</h3>
-        ${table(["機台", ["工單", "num"], ["數量", "num"], ["預估工時", "num"], "最近交期"], d.machines.map((m) => `<tr>
-          <td>${esc(m.machine)}</td><td class="num">${n(m.orders)}</td><td class="num">${n(m.qty)}</td>
-          <td class="num">${m.hours ? n(Math.round(m.hours * 10) / 10) + " 小時" : "—"}${m.no_cycle ? `<span class="muted">（${m.no_cycle} 張未設工時）</span>` : ""}</td>
-          <td>${esc(m.next_due || "")}</td></tr>`), "目前沒有未完工的工單")}
-        <p class="muted" style="margin-bottom:0">在品項裡填「單件工時」就能算出每台機器還要做多久。</p></div>
+        ${table(["機台", ["工序", "num"], ["剩餘工時", "num"], "約可做完", ""], d.machines.map((m) => `<tr>
+          <td>${esc(m.machine)}</td><td class="num">${n(m.orders)}</td>
+          <td class="num">${m.hours ? n(m.hours) + " 小時" : "—"}${m.no_cycle ? `<span class="muted">（${m.no_cycle} 道未設工時）</span>` : ""}</td>
+          <td>${esc(m.free_date || "")}</td><td>${m.late ? `<span class="tag danger">${m.late} 會延誤</span>` : ""}</td></tr>`), "目前沒有未完工的工序")}
+        <p class="muted" style="margin-bottom:0"><a class="plink" href="#schedule">打開排程看板 →</a>　在品項設定「製程路線」與工時，估算會更準。</p></div>
       <div class="card"><h3>🏭 進行中工單</h3>
         ${table(["工單", "品名", ["數量", "num"], "機台", "交期", "狀態"], d.work_orders.map((w) => `
           <tr class="clickable" data-wo="${w.id}"><td>${esc(w.no)}</td><td>${esc(w.name)}</td>
@@ -244,6 +350,7 @@ views.dashboard = async () => {
   $$("[data-order]").forEach((tr) => (tr.onclick = () => showOrder(tr.dataset.order)));
   $$("[data-wo]").forEach((tr) => (tr.onclick = () => showWorkOrder(tr.dataset.wo)));
   $$("[data-item]").forEach((tr) => (tr.onclick = () => showItem(tr.dataset.item)));
+  $$("[data-quote]").forEach((tr) => (tr.onclick = () => go("quote:" + tr.dataset.quote)));
   $$("[data-pid]").forEach((tr) => (tr.onclick = () => go("partner:" + tr.dataset.pid)));
   $$("[data-code]").forEach((tr) => (tr.onclick = () => {
     views.history.state = { search: tr.dataset.code, kind: "sales", date_from: "", date_to: "" };
@@ -365,6 +472,7 @@ async function showItem(id) {
         <button type="button" id="i-edit">修改資料</button>
         <button type="button" class="ghost" id="i-count">盤點</button>
         <button type="button" class="ghost" id="i-moves">庫存異動</button>
+        <button type="button" class="ghost" id="i-route">製程路線${d.routes.length ? `（${d.routes.length} 道）` : ""}</button>
         ${["成品", "半成品"].includes(i.category) ? '<button type="button" class="ghost" id="i-wo">開工單</button>' : ""}
       </div>
       ${d.open_lines.length ? `<h3>未結訂單</h3>${table(["單號", "對象", ["數量", "num"], ["已交", "num"], "交期"],
@@ -373,6 +481,10 @@ async function showItem(id) {
       ${d.work_orders.length ? `<h3>生產中工單</h3>${table(["工單", ["數量", "num"], "機台", "交期", "狀態"],
         d.work_orders.map((w) => `<tr><td>${esc(w.no)}</td><td class="num">${n(w.qty)}</td><td>${esc(w.machine)}</td>
           <td>${esc(w.due_date)}</td><td>${statusTag(w.status)}</td></tr>`))}` : ""}
+      <h3 style="margin-top:16px">圖面 / 附件</h3>
+      ${gallery(d.files, { deletable: true })}
+      <label class="btn ghost small" style="margin-top:6px">📷 加圖面 <input type="file" id="i-add" multiple accept="${FILE_ACCEPT}" hidden></label>
+      ${d.routes.length ? `<p class="small">製程：${d.routes.map((o) => esc(o.process)).join(" → ")}</p>` : ""}
       <h3 style="margin-top:16px">跟誰往來、最近價格</h3>
       ${table(["對象", "", ["次數", "num"], ["數量", "num"], ["最近單價", "num"], "最近"], d.partners.map((p) => `<tr>
         <td>${p.partner_id ? `<a class="plink" data-pid="${p.partner_id}">${esc(p.partner_name)}</a>` : esc(p.partner_name)}</td>
@@ -387,6 +499,16 @@ async function showItem(id) {
       $("#i-count").onclick = () => stockCount(i);
       $("#i-moves").onclick = () => { dlg.close(); views.moves.state = { item_id: i.id }; go("moves"); };
       if ($("#i-wo")) $("#i-wo").onclick = () => workOrderForm({ item_id: i.id });
+      $("#i-route").onclick = () => routeEditor({
+        title: `${i.code} 的製程路線`, ops: d.routes,
+        hint: "設定一次，以後開這個零件的工單會自動帶入這些工序。單件工時用來估算排程。",
+        onSave: async (ops) => { await api("PUT", `/api/items/${i.id}/routes`, { ops }); toast("已儲存製程路線"); showItem(i.id); },
+      });
+      $("#i-add").onchange = async (e) => {
+        try { await uploadFiles("item", i.id, e.target.files, (m) => toast(m)); toast("已加入圖面"); showItem(i.id); }
+        catch (err) { alert(err.message); }
+      };
+      wireGallery($("#modal"), () => showItem(i.id));
       $$("#modal [data-order]").forEach((tr) => (tr.onclick = () => showOrder(tr.dataset.order)));
       $$("#modal .plink").forEach((a) => (a.onclick = () => { dlg.close(); go("partner:" + a.dataset.pid); }));
     },
@@ -1085,6 +1207,7 @@ async function workOrderForm(pre = {}) {
           ...openSales.map((o) => [o.id, `${o.no} ${o.partner_name}`])], pre.sales_order_id)}
         ${field("機台", "machine", "", 'placeholder="例：CNC-02 車床" list="dl-machines"')}
         ${field("交期", "due_date", pre.due_date || "", 'type="date"')}
+        <div class="wide muted small" id="wo-route"></div>
         ${field("備註（圖號、加工注意事項）", "note", "", "", true)}
       </div>
       <h3 style="margin-top:16px">用料（完工時自動扣庫存）</h3>
@@ -1094,7 +1217,15 @@ async function workOrderForm(pre = {}) {
       ${itemDatalistHtml("dl-products", products)}${itemDatalistHtml("dl-mats", materials)}${datalist("dl-machines", machines)}`,
     onOpen: () => {
       const wirePick = (root, list) => $$(".ipick", root).forEach((inp) => (inp.onchange = () => resolvePick(inp, list)));
-      wirePick($("#modal-body .fields"), products);
+      $$("#modal-body .fields .ipick").forEach((inp) => (inp.onchange = async () => {
+        const it = resolvePick(inp, products);
+        $("#wo-route").textContent = "";
+        if (!it) return;
+        const r = await api("GET", `/api/items/${it.id}/routes`);
+        $("#wo-route").innerHTML = r.length ? "製程：" + r.map((o) => esc(o.process) + (o.outsource ? "（外包）" : o.machine ? `（${esc(o.machine)}）` : "")).join(" → ")
+          : "這個品項還沒設定製程路線，會用上面的「機台」建一道工序。可到品項頁設定製程路線。";
+      }));
+      if (pre.item_id) $("#modal-body .fields .ipick").onchange();
       wirePick($("#mats"), materials);
       const wire = () => $$("#mats .rm").forEach((b) => (b.onclick = () => b.closest("tr").remove()));
       $("#add-mat").onclick = () => { $("#mats").insertAdjacentHTML("beforeend", matRow()); wire(); wirePick($("#mats"), materials); };
@@ -1126,12 +1257,21 @@ async function showWorkOrder(id) {
         <div><span>品項</span>${esc(w.code)} ${esc(w.name)}</div>
         <div><span>數量</span>${n(w.qty)} ${esc(w.unit)}</div>
         <div><span>狀態</span>${statusTag(w.status)}</div>
-        <div><span>機台</span>${esc(w.machine || "—")}</div>
+        <div><span>預估完成</span>${esc((w.ops.find((o) => o.status !== "done") || {}).est_finish || "—")}</div>
         <div><span>交期</span>${dueTag(w)}</div>
         <div><span>訂單</span>${esc(w.customer || "")} ${esc(w.sales_no || "庫存備貨")}</div>
         ${w.status === "done" ? `<div><span>良品 / 不良</span>${n(w.good_qty)} / ${n(w.scrap_qty)}（${esc(w.finished)} 完工）</div>` : ""}
         ${w.note ? `<div><span>備註</span>${esc(w.note)}</div>` : ""}
       </div>
+      <h3>工序 <button type="button" class="small ghost" id="edit-ops" ${active ? "" : "hidden"}>編輯工序</button></h3>
+      ${table(["#", "工序", "機台 / 外包", ["完成", "num"], "狀態", ""], w.ops.map((o) => `<tr>
+        <td>${o.seq}</td><td>${esc(o.process)}</td>
+        <td>${o.outsource ? `🚚 ${esc(o.vendor || "未指定廠商")}${o.expected_back ? `（預計 ${esc(o.expected_back)} 回）` : ""}` : esc(o.machine || "未排機台")}</td>
+        <td class="num">${n(o.good_qty)} / ${n(w.qty)}${o.scrap_qty ? ` <span class="muted">不良 ${n(o.scrap_qty)}</span>` : ""}</td>
+        <td>${o.status === "done" ? '<span class="tag ok">完成</span>' : o.status === "doing" ? '<span class="tag warn">進行中</span>' : '<span class="tag">待做</span>'}</td>
+        <td>${active && o.status !== "done" ? (o.outsource && !o.sent_date ? `<button type="button" class="small" data-send="${o.id}">送外包</button>`
+          : `<button type="button" class="small" data-report="${o.id}">${o.outsource ? "已回廠" : "報工"}</button>`) : ""}</td></tr>`), "沒有工序")}
+      ${w.files.length ? `<h3>圖面</h3>${gallery(w.files)}` : ""}
       <h3>用料</h3>
       ${table(["材料", ["每件用量", "num"], ["本單需求", "num"], ["目前庫存", "num"]], w.materials.map((m) => {
         const need = m.qty_per_unit * w.qty;
@@ -1141,7 +1281,7 @@ async function showWorkOrder(id) {
           <td class="num">${n(m.stock)}${short ? " ⚠️ 不足" : ""}</td></tr>`;
       }), "未設定用料")}
       ${active ? `<h3 style="margin-top:16px">完工回報</h3><div class="fields">
-        <label>良品數<input id="good" type="number" step="any" min="0" value="${w.qty}"></label>
+        <label>良品數<input id="good" type="number" step="any" min="0" value="${w.ops.length ? w.ops[w.ops.length - 1].good_qty || w.qty : w.qty}"></label>
         <label>不良品數<input id="scrap" type="number" step="any" min="0" value="0"></label></div>` : ""}
       <div class="actions" style="justify-content:flex-start">
         ${w.status === "pending" ? `<button type="button" id="start">開始生產</button>` : ""}
@@ -1151,6 +1291,16 @@ async function showWorkOrder(id) {
     onOpen: () => {
       const err = (e) => ($("#detail-error").textContent = e.message);
       const close = () => { $("#modal").close(); refresh(); };
+      $$("#modal [data-report]").forEach((b) => (b.onclick = () => {
+        const op = w.ops.find((o) => String(o.id) === b.dataset.report);
+        reportForm(b.dataset.report, !!op.outsource, () => showWorkOrder(w.id));
+      }));
+      $$("#modal [data-send]").forEach((b) => (b.onclick = () => sendOutForm(b.dataset.send)));
+      if ($("#edit-ops")) $("#edit-ops").onclick = () => routeEditor({
+        title: `工單 ${w.no} 的工序`, ops: w.ops,
+        hint: "注意：重新儲存會清除已回報的數量，建議只在還沒開始時調整。",
+        onSave: async (ops) => { await api("PUT", `/api/workorders/${w.id}/ops`, { ops }); toast("已更新工序"); refresh(); },
+      });
       if ($("#start")) $("#start").onclick = async () => {
         try { await api("POST", `/api/workorders/${w.id}/start`); toast("已開工"); close(); } catch (e) { err(e); }
       };
@@ -1194,6 +1344,494 @@ views.moves = async () => {
 };
 
 // ---------------------------------------------------------------- 備份 / 匯出
+
+// ---------------------------------------------------------------- 圖面報價
+
+const Q_STATUS = { new: ["待報價", "warn"], quoted: ["已報價", ""], won: ["成交", "ok"], lost: ["未成交", "danger"] };
+const qTag = (s) => `<span class="tag ${Q_STATUS[s][1]}">${Q_STATUS[s][0]}</span>`;
+const QUOTE_CATS = ["車床件", "銑床件", "車銑複合件", "線割件", "模具零件", "治具", "鈑金焊接", "組立件"];
+
+const quotesState = () => views.quotes.state || (views.quotes.state = { status: "", search: "", category: "" });
+
+views.quotes = async () => {
+  const st = quotesState();
+  const res = await api("GET", "/api/quotes?" + new URLSearchParams(st));
+  const c = res.counts;
+  const total = Object.values(c).reduce((a, b) => a + b, 0);
+  app.innerHTML = `
+    <h1>圖面報價 <span class="spacer"></span><button id="q-new">📷 收到圖面：新增詢價</button></h1>
+    <div class="tabs">
+      ${[["", "全部", total], ["new", "待報價", c.new], ["quoted", "已報價", c.quoted], ["won", "成交", c.won], ["lost", "未成交", c.lost]]
+        .map(([v, l, k]) => `<a class="tab ${st.status === v ? "on" : ""}" data-st="${v}">${l} <span class="count">${k || 0}</span></a>`).join("")}
+    </div>
+    <div class="toolbar"><input id="q-search" placeholder="搜尋客戶、圖號、品名、材質、單號" value="${esc(st.search)}" style="flex:1;min-width:200px"></div>
+    ${res.categories.length ? `<div class="chips"><a class="chip ${!st.category ? "on" : ""}" data-cat="">全部分類</a>
+      ${res.categories.map((k) => `<a class="chip ${st.category === k ? "on" : ""}" data-cat="${esc(k)}">${esc(k)}</a>`).join("")}</div>` : ""}
+    ${res.rows.length ? `<div class="qgrid">${res.rows.map((q) => `
+      <div class="qcard" data-q="${q.id}">
+        <div class="qthumb">${q.thumb ? `<img src="/api/files/${q.thumb}/raw" loading="lazy" alt="">` : `<span>${q.files ? "📄 " + q.files + " 個檔案" : "沒有圖面"}</span>`}</div>
+        <div class="qbody">
+          <div class="qtop"><b>${esc(q.customer || "")}</b>${qTag(q.status)}</div>
+          <div class="ellipsis-block">${esc(q.parts || q.note || "（未填明細）")}</div>
+          <div class="muted small">${esc(q.no)}　${esc(q.inquiry_date)}${q.category ? "　" + esc(q.category) : ""}</div>
+          <div class="qtop"><span class="muted small">${q.lines} 項${q.reply_by && q.status === "new" ? `　回覆期限 ${esc(q.reply_by)}` : ""}</span>
+            <b>${q.total ? money(q.total) : ""}</b></div>
+        </div></div>`).join("")}</div>`
+      : `<div class="card"><p class="empty">${st.search || st.status || st.category ? "沒有符合的報價" : "還沒有報價。收到客戶圖面時，按上面的按鈕拍照或上傳就能建檔。"}</p></div>`}`;
+  $("#q-new").onclick = () => quoteQuickForm();
+  $$("[data-st]").forEach((a) => (a.onclick = () => { st.status = a.dataset.st; refresh(); }));
+  $$("[data-cat]").forEach((a) => (a.onclick = () => { st.category = a.dataset.cat; refresh(); }));
+  $$("[data-q]").forEach((d) => (d.onclick = () => go("quote:" + d.dataset.q)));
+  let timer;
+  $("#q-search").oninput = (e) => { clearTimeout(timer); timer = setTimeout(() => { st.search = e.target.value; refresh(); }, 350); };
+  if (st.search) { $("#q-search").focus(); $("#q-search").setSelectionRange(st.search.length, st.search.length); }
+};
+
+// 快速建立：手機上拍照 / 選圖 + 客戶就能先存，細節回公司再補
+async function quoteQuickForm() {
+  const [cus, list] = await Promise.all([customers(true), api("GET", "/api/quotes")]);
+  const cats = [...new Set([...list.categories, ...QUOTE_CATS])];
+  modal({
+    title: "新增詢價（收到圖面）",
+    ok: "建立",
+    body: `<div class="fields">
+        <label class="wide">圖面 / 照片 / 檔案（可多選；手機可直接拍照）
+          <input type="file" id="qf-files" multiple accept="${FILE_ACCEPT}"></label>
+        <div class="wide" id="qf-preview"></div>
+        ${selectField("客戶", "partner_id", [["", "— 選擇既有客戶 —"], ...cus.map((p) => [p.id, pname(p)])], "")}
+        ${field("或：新客戶名稱", "customer_name", "", 'placeholder="新客戶直接打名字"')}
+        ${field("分類", "category", "", 'list="dl-qcat" placeholder="例：車床件"')}
+        ${field("回覆期限", "reply_by", "", 'type="date"')}
+        ${field("品名", "part_name", "", 'placeholder="可先空白"')}
+        ${field("圖號", "drawing_no", "")}
+        ${field("材質", "material", "", 'list="dl-material"')}
+        ${field("數量", "qty", "", 'type="number" step="any" min="0"')}
+        ${field("備註（客戶要求、交期、聯絡人…）", "note", "", "", true)}
+      </div>${datalist("dl-qcat", cats)}${datalist("dl-material", MATERIALS)}`,
+    onOpen: () => {
+      $("#qf-files").onchange = (e) => {
+        $("#qf-preview").innerHTML = [...e.target.files].map((f) => /^image\//.test(f.type)
+          ? `<img class="mini" src="${URL.createObjectURL(f)}" alt="">` : `<span class="tag">${esc(f.name)}</span>`).join(" ");
+      };
+    },
+    onSubmit: async (form) => {
+      const d = formData(form);
+      const files = $("#qf-files").files;
+      if (!d.partner_id && !d.customer_name.trim()) throw new Error("請選擇客戶或輸入新客戶名稱");
+      const line = { part_name: d.part_name, drawing_no: d.drawing_no, material: d.material, qty: d.qty || 1 };
+      const r = await api("POST", "/api/quotes", { partner_id: d.partner_id, customer_name: d.customer_name, category: d.category,
+        reply_by: d.reply_by, note: d.note, lines: line.part_name || line.drawing_no ? [line] : [] });
+      if (files.length) await uploadFiles("quote", r.id, files, (m) => ($("#modal-error").textContent = m));
+      toast("已建立 " + r.no);
+      go("quote:" + r.id);
+    },
+  });
+}
+
+views.quote = async (id) => {
+  const q = await api("GET", "/api/quotes/" + id);
+  const locked = q.status === "won";
+  const rate = q.hourly_rate;
+  const lineCard = (l = {}) => `<div class="qline">
+      <div class="fields">
+        <input type="hidden" name="item_id" value="${l.item_id || ""}">
+        ${field("品名 *", "part_name", l.part_name)}
+        ${field("圖號", "drawing_no", l.drawing_no)}
+        ${field("版次", "revision", l.revision)}
+        ${field("材質", "material", l.material, 'list="dl-material"')}
+        ${field("表面 / 熱處理", "finish", l.finish, 'list="dl-finish"')}
+        ${field("數量", "qty", l.qty ?? 1, 'type="number" step="any" min="0"')}
+      </div>
+      <div class="est">
+        <b>估價</b>
+        ${field("材料費 / 件", "material_cost", l.material_cost || "", 'type="number" step="any" min="0"')}
+        ${field("加工工時（分 / 件）", "cycle_min", l.cycle_min || "", 'type="number" step="any" min="0"')}
+        ${field("架機時間（分）", "setup_min", l.setup_min || "", 'type="number" step="any" min="0"')}
+        ${field("外包費 / 件", "outsource_cost", l.outsource_cost || "", 'type="number" step="any" min="0"')}
+        ${field("利潤 %", "margin_pct", l.margin_pct ?? 20, 'type="number" step="any" min="0"')}
+        <div class="sugg">成本 <b class="cost">—</b><br>建議單價 <b class="suggested">—</b>
+          <button type="button" class="small ghost use">套用</button></div>
+      </div>
+      <div class="fields">
+        ${field("報價單價 *", "unit_price", l.unit_price || "", 'type="number" step="any" min="0"')}
+        ${field("交期（天）", "lead_days", l.lead_days || "", 'type="number" step="any" min="0"')}
+        ${field("備註", "note", l.note)}
+        <div class="sub-total" style="align-self:end"></div>
+      </div>
+      ${l.past && l.past.length ? `<div class="past">📌 參考：${l.past.map((p) => `${esc(p.type)} ${esc(p.date)} ${esc(p.who || "")} ${n(p.qty)}×<b>${n(p.unit_price)}</b>`).join("　")}</div>` : ""}
+      ${locked ? "" : '<button type="button" class="small ghost rmline">移除這項</button>'}
+    </div>`;
+  app.innerHTML = `
+    <h1><a class="muted" style="cursor:pointer" id="back">報價</a> › ${esc(q.no)} ${qTag(q.status)}
+      <span class="spacer"></span>
+      ${q.status !== "won" ? `<button class="ghost" id="q-lost">未成交</button>` : ""}
+      ${q.status === "new" ? `<button class="ghost" id="q-quoted">標記已報價</button>` : ""}
+      <button class="ghost" id="q-print">🖨️ 列印報價單</button>
+      ${q.status !== "won" ? `<button id="q-win">✅ 成交 → 轉訂單</button>` : `<button id="q-order">查看訂單 ${esc(q.order_no || "")}</button>`}</h1>
+    ${q.status === "lost" ? `<div class="card" style="background:var(--danger-bg)">未成交${q.lost_reason ? "：" + esc(q.lost_reason) : ""}</div>` : ""}
+    <form id="q-form">
+    <div class="card">
+      <div class="fields">
+        ${selectField("客戶", "partner_id", [["", q.customer_name ? `（新客戶）${q.customer_name}` : "— 請選擇 —"], ...(await customers()).map((p) => [p.id, pname(p)])], q.partner_id || "")}
+        ${field("新客戶名稱", "customer_name", q.customer_name, 'placeholder="選了既有客戶可空白"')}
+        ${field("聯絡人", "contact", q.contact)}
+        ${field("分類", "category", q.category, 'list="dl-qcat"')}
+        ${field("詢價日", "inquiry_date", q.inquiry_date, 'type="date"')}
+        ${field("回覆期限", "reply_by", q.reply_by, 'type="date"')}
+        ${field("報價有效至", "valid_until", q.valid_until, 'type="date"')}
+        ${field("備註", "note", q.note, "", true)}
+      </div>
+    </div>
+    <div class="card"><h3>圖面 / 附件（${q.files.length}）</h3>
+      ${gallery(q.files, { deletable: !locked })}
+      <label class="btn ghost" style="margin-top:8px">📷 加圖面 / 照片 <input type="file" id="q-add" multiple accept="${FILE_ACCEPT}" hidden></label>
+      <span class="muted small" id="q-up"></span></div>
+    <div class="card"><h3>報價明細 <span class="muted small">（工時費率 ${n(rate)} 元/小時，可在「設定」修改）</span></h3>
+      <div id="q-lines">${(q.lines.length ? q.lines : [{}]).map(lineCard).join("")}</div>
+      ${locked ? "" : '<button type="button" class="small ghost" id="q-addline">＋ 加一項</button>'}
+      <p style="text-align:right;font-size:18px">合計 <b id="q-total"></b></p>
+      ${locked ? '<p class="muted">已成交轉訂單，報價內容不能再修改。</p>' : '<div class="actions"><button type="submit">儲存報價</button></div>'}
+    </div>
+    </form>${datalist("dl-material", MATERIALS)}${datalist("dl-finish", FINISHES)}${datalist("dl-qcat", QUOTE_CATS)}`;
+
+  const box = $("#q-lines");
+  const val = (card, name) => Number($(`[name=${name}]`, card).value || 0);
+  const recalc = () => {
+    let total = 0;
+    $$(".qline", box).forEach((card) => {
+      const qty = Math.max(val(card, "qty"), 1);
+      const cost = val(card, "material_cost") + (val(card, "cycle_min") + val(card, "setup_min") / qty) / 60 * rate + val(card, "outsource_cost");
+      const sug = Math.round(cost * (1 + val(card, "margin_pct") / 100) * 10) / 10;
+      $(".cost", card).textContent = cost ? n(Math.round(cost * 10) / 10) : "—";
+      $(".suggested", card).textContent = cost ? n(sug) : "—";
+      $(".use", card).onclick = () => { $("[name=unit_price]", card).value = sug; recalc(); };
+      const sub = val(card, "qty") * val(card, "unit_price");
+      total += sub;
+      $(".sub-total", card).textContent = sub ? "小計 " + money(sub) : "";
+    });
+    $("#q-total").textContent = money(total);
+  };
+  const wire = () => {
+    $$("input", box).forEach((i) => (i.oninput = recalc));
+    $$(".rmline", box).forEach((b) => (b.onclick = () => { b.closest(".qline").remove(); recalc(); }));
+  };
+  if (locked) $$("#q-form input, #q-form select").forEach((i) => (i.disabled = true));
+  wire();
+  recalc();
+  if ($("#q-addline")) $("#q-addline").onclick = () => { box.insertAdjacentHTML("beforeend", lineCard()); wire(); recalc(); };
+  const collect = () => {
+    const d = formData($("#q-form"));
+    return {
+      partner_id: $("#q-form [name=partner_id]").value, customer_name: d.customer_name, contact: d.contact, category: d.category,
+      inquiry_date: d.inquiry_date, reply_by: d.reply_by, valid_until: d.valid_until, note: $("#q-form > .card [name=note]").value,
+      lines: $$(".qline", box).map((card) => Object.fromEntries($$("input", card).map((i) => [i.name, i.value]))),
+    };
+  };
+  const save = async () => { if (!locked) await api("PUT", "/api/quotes/" + q.id, collect()); };
+  $("#q-form").onsubmit = async (e) => {
+    e.preventDefault();
+    try { await save(); toast("已儲存"); refresh(); } catch (err) { alert(err.message); }
+  };
+  $("#back").onclick = () => go("quotes");
+  $("#q-add").onchange = async (e) => {
+    try {
+      await uploadFiles("quote", q.id, e.target.files, (m) => ($("#q-up").textContent = m));
+      toast("已加入");
+      refresh();
+    } catch (err) { alert(err.message); }
+  };
+  wireGallery(app, refresh);
+  const act = (fn) => async () => { try { await fn(); } catch (err) { alert(err.message); } };
+  if ($("#q-quoted")) $("#q-quoted").onclick = act(async () => {
+    await save();
+    await api("POST", `/api/quotes/${q.id}/status`, { status: "quoted" });
+    toast("已標記為已報價");
+    refresh();
+  });
+  if ($("#q-lost")) $("#q-lost").onclick = act(async () => {
+    const reason = prompt("未成交原因（例：價格、交期、客戶取消）：", "");
+    if (reason === null) return;
+    await api("POST", `/api/quotes/${q.id}/status`, { status: "lost", lost_reason: reason });
+    refresh();
+  });
+  if ($("#q-win")) $("#q-win").onclick = act(async () => {
+    await save();
+    const po = prompt("客戶訂單號（沒有可空白）：", "");
+    if (po === null) return;
+    const r = await api("POST", `/api/quotes/${q.id}/convert`, { customer_po: po });
+    toast("已建立訂單 " + r.order_no);
+    showOrder(r.order_id);
+    refresh();
+  });
+  if ($("#q-order")) $("#q-order").onclick = () => showOrder(q.sales_order_id);
+  $("#q-print").onclick = act(async () => {
+    await save();
+    printQuote(await api("GET", "/api/quotes/" + q.id), await api("GET", "/api/settings"));
+  });
+};
+
+function printQuote(q, st) {
+  let area = $("#print-area");
+  if (!area) { area = document.createElement("div"); area.id = "print-area"; document.body.appendChild(area); }
+  const total = q.lines.reduce((s, l) => s + l.qty * l.unit_price, 0);
+  const p = q.partner || {};
+  area.innerHTML = `
+    <h2 style="margin-bottom:0">${esc(st.company_name || "")}</h2>
+    <p style="text-align:center;margin:4px 0">${esc(st.company_address || "")}　${st.company_phone ? "電話 " + esc(st.company_phone) : ""}
+      ${st.company_fax ? "　傳真 " + esc(st.company_fax) : ""}${st.company_tax_id ? "　統編 " + esc(st.company_tax_id) : ""}</p>
+    <h2>報 價 單</h2>
+    <p>客戶：${esc(p.name || q.customer_name)}　${p.contact || q.contact ? "聯絡人：" + esc(q.contact || p.contact) : ""}
+      ${p.phone ? "　電話：" + esc(p.phone) : ""}<br>
+      報價單號：${esc(q.no)}　報價日期：${esc(q.quoted_date || today())}　${q.valid_until ? "有效期限：" + esc(q.valid_until) : ""}</p>
+    <table><thead><tr><th>#</th><th>品名</th><th>圖號 / 版次</th><th>材質</th><th>表面 / 熱處理</th><th>數量</th><th>單價</th><th>金額</th><th>交期</th></tr></thead>
+    <tbody>${q.lines.map((l, i) => `<tr><td>${i + 1}</td><td>${esc(l.part_name)}</td><td>${esc(l.drawing_no)} ${esc(l.revision)}</td>
+      <td>${esc(l.material)}</td><td>${esc(l.finish)}</td><td style="text-align:right">${n(l.qty)}</td>
+      <td style="text-align:right">${n(l.unit_price)}</td><td style="text-align:right">${money(l.qty * l.unit_price)}</td>
+      <td>${l.lead_days ? n(l.lead_days) + " 天" : ""}</td></tr>`).join("")}</tbody></table>
+    <p style="text-align:right">合計（未稅）：${money(total)}</p>
+    ${q.note ? `<p>備註：${esc(q.note)}</p>` : ""}
+    <p style="white-space:pre-wrap">${esc(st.quote_terms || "1. 以上報價未含營業稅。\n2. 交期自確認訂單及收到正式圖面起算。")}</p>
+    <p style="margin-top:40px">客戶確認回簽：＿＿＿＿＿＿＿＿　　報價人：＿＿＿＿＿＿＿＿</p>`;
+  window.print();
+}
+
+// ---------------------------------------------------------------- 排程看板
+
+const OP_STATUS = { todo: ["待加工", ""], doing: ["加工中", "ok"], done: ["完成", ""] };
+
+function opBadges(o) {
+  return [
+    o.status === "doing" ? `<span class="tag ok">${o.outsource ? "外包中" : "加工中"}</span>` : "",
+    o.late ? '<span class="tag danger">會延誤</span>' : "",
+    o.waiting_prev && o.status === "todo" ? `<span class="tag">等${esc(o.waiting_prev)}</span>` : "",
+    o.conflict ? '<span class="tag warn">順序衝突</span>' : "",
+    o.overdue ? '<span class="tag danger">逾期未回</span>' : "",
+  ].join(" ");
+}
+
+views.schedule = async () => {
+  const s = await api("GET", "/api/schedule");
+  const machOpts = (sel) => s.machines.map((m) => `<option value="${m.id}" ${m.id === sel ? "selected" : ""}>${esc(m.name)}</option>`).join("");
+  const opCard = (o, mid) => `<div class="opcard ${o.late ? "late" : ""}" data-op="${o.id}">
+      <div class="optop"><b>${esc(o.wo_no)}</b><span>${opBadges(o)}</span></div>
+      <div>${esc(o.code)} ${esc(o.item_name)}${o.drawing_no ? ` <span class="muted">${esc(o.drawing_no)}</span>` : ""}</div>
+      <div class="muted small">${esc(o.process)}（第 ${o.seq}/${o.op_count} 道）　${n(o.good_qty)}/${n(o.wo_qty)} ${esc(o.unit || "")}
+        ${o.customer ? "　" + esc(o.customer) : ""}</div>
+      <div class="small">預估 ${esc(o.est_start)} → <b>${esc(o.est_finish)}</b>　剩 ${n(o.remaining_hours)} 小時
+        ${o.due_date ? `　交期 <b class="${o.late ? "down" : ""}">${esc(o.due_date)}</b>` : ""}</div>
+      ${mid !== "out" ? `<div class="opbtns">
+        <button type="button" class="small ghost" data-mv="top" title="排到最前面">⇈</button>
+        <button type="button" class="small ghost" data-mv="up">↑</button>
+        <button type="button" class="small ghost" data-mv="down">↓</button>
+        <select class="small remach" title="換機台"><option value="">（未排機台）</option>${machOpts(o.machine_id)}</select>
+        <button type="button" class="small ghost" data-wo="${o.wo_id}">工單</button></div>` : `<div class="opbtns">
+        ${o.sent_date ? `<span class="small">${esc(o.vendor || "")}　${esc(o.sent_date)} 送出，預計 <b class="${o.overdue ? "down" : ""}">${esc(o.expected_back)}</b> 回</span>
+          <button type="button" class="small" data-back="${o.id}">已回廠</button>`
+          : `<span class="small muted">尚未送出${o.vendor ? "（" + esc(o.vendor) + "）" : ""}</span><button type="button" class="small" data-send="${o.id}">送外包</button>`}
+        <button type="button" class="small ghost" data-wo="${o.wo_id}">工單</button></div>`}
+    </div>`;
+  const late = s.work_orders.filter((w) => w.late);
+  app.innerHTML = `
+    <h1>生產排程 <span class="muted" style="font-size:15px;font-weight:400">依機台佇列、工時與前後工序自動估算完工日</span>
+      <span class="spacer"></span><button class="ghost" id="sch-mach">⚙️ 機台設定</button><button id="sch-wo">＋ 開工單</button></h1>
+    ${late.length ? `<div class="card" style="background:var(--danger-bg)"><b>⚠️ ${late.length} 張工單預估會延誤：</b>
+      ${late.map((w) => `<a class="plink" data-wo="${w.wo_id}">${esc(w.wo_no)} ${esc(w.item)}（交期 ${esc(w.due_date)}，預估 ${esc(w.est_finish)}）</a>`).join("　")}
+      <div class="muted small">可以把它往前排、換到比較空的機台，或跟客戶協調交期。</div></div>` : ""}
+    ${!s.machines.length ? `<div class="card"><p>還沒有設定機台。請先按「機台設定」建立你們的機台（例：CNC-01 車床、CNC-02 綜合加工機），開工單時就能排進去。</p></div>` : ""}
+    <div class="board">
+      ${s.machines.map((m) => `<div class="lane">
+        <div class="lanehead"><b>${esc(m.name)}</b><span class="muted small">每天 ${n(m.daily_hours)} 小時</span>
+          <div class="small">${m.queue.length} 道工序・${n(m.load_hours)} 小時${m.free_date ? `・約 ${esc(m.free_date)} 做完` : ""}
+            ${m.late ? `<span class="tag danger">${m.late} 會延誤</span>` : ""}</div></div>
+        ${m.queue.map((o) => opCard(o, m.id)).join("") || '<p class="muted small">目前沒有工作</p>'}</div>`).join("")}
+      ${s.unassigned.length ? `<div class="lane"><div class="lanehead"><b>未排機台</b></div>${s.unassigned.map((o) => opCard(o, null)).join("")}</div>` : ""}
+      <div class="lane"><div class="lanehead"><b>🚚 外包</b><div class="small">${s.outsource.length} 道工序</div></div>
+        ${s.outsource.map((o) => opCard(o, "out")).join("") || '<p class="muted small">沒有外包中的工序</p>'}</div>
+    </div>`;
+  $("#sch-mach").onclick = () => machineManager();
+  $("#sch-wo").onclick = () => workOrderForm();
+  $$("[data-wo]").forEach((b) => (b.onclick = () => showWorkOrder(b.dataset.wo)));
+  const act = (fn) => async (e) => { try { await fn(e); refresh(); } catch (err) { alert(err.message); } };
+  $$(".opcard").forEach((card) => {
+    const id = card.dataset.op;
+    $$("[data-mv]", card).forEach((b) => (b.onclick = act(() => api("POST", `/api/ops/${id}/move`, { direction: b.dataset.mv }))));
+    const sel = $(".remach", card);
+    if (sel) sel.onchange = act(() => api("PUT", `/api/ops/${id}`, { machine_id: sel.value }));
+  });
+  $$("[data-send]").forEach((b) => (b.onclick = () => sendOutForm(b.dataset.send)));
+  $$("[data-back]").forEach((b) => (b.onclick = () => reportForm(b.dataset.back, true)));
+};
+
+async function machineManager() {
+  const list = await api("GET", "/api/machines");
+  const row = (m = {}) => `<tr data-id="${m.id || ""}"><td><input name="name" value="${esc(m.name || "")}" placeholder="例：CNC-01 車床"></td>
+    <td><input name="kind" value="${esc(m.kind || "")}" placeholder="車床 / 銑床 / 綜合…"></td>
+    <td><input name="daily_hours" type="number" step="0.5" min="0.5" max="24" value="${m.daily_hours ?? 8}" style="width:80px"></td>
+    <td>${m.id ? `<button type="button" class="small ghost mdel">停用</button>` : ""}</td></tr>`;
+  modal({
+    title: "機台設定",
+    body: `<p class="muted">每天可用時數會用來估算完工日（例：兩班制填 16，有人看機到晚上填 12）。</p>
+      <table class="lines"><thead><tr><th>機台名稱</th><th>類型</th><th>每天時數</th><th></th></tr></thead>
+      <tbody id="mrows">${list.map(row).join("")}${row()}</tbody></table>
+      <button type="button" class="small ghost" id="madd">＋ 加一台</button>`,
+    onOpen: () => {
+      $("#madd").onclick = () => $("#mrows").insertAdjacentHTML("beforeend", row());
+      $$(".mdel").forEach((b) => (b.onclick = async () => {
+        const tr = b.closest("tr");
+        try { await api("DELETE", "/api/machines/" + tr.dataset.id); tr.remove(); toast("已停用"); }
+        catch (e) { $("#modal-error").textContent = e.message; }
+      }));
+    },
+    onSubmit: async () => {
+      for (const tr of $$("#mrows tr")) {
+        const d = Object.fromEntries($$("input", tr).map((i) => [i.name, i.value]));
+        if (!d.name.trim()) continue;
+        if (tr.dataset.id) await api("PUT", "/api/machines/" + tr.dataset.id, d);
+        else await api("POST", "/api/machines", d);
+      }
+      toast("已儲存");
+      refresh();
+    },
+  });
+}
+
+async function sendOutForm(opId) {
+  const vendors = await api("GET", "/api/partners?type=supplier");
+  modal({
+    title: "送外包",
+    ok: "確認送出",
+    body: `<div class="fields">
+      ${selectField("外包廠商 *", "vendor_id", [["", "— 請選擇 —"], ...vendors.map((v) => [v.id, pname(v)])], "")}
+      ${field("送出日期", "sent_date", today(), 'type="date"')}
+      ${field("預計回廠", "expected_back", "", 'type="date"')}
+    </div><p class="muted">預計回廠沒填會用製程設定的天數（預設 5 天）。</p>`,
+    onSubmit: async (form) => {
+      await api("POST", `/api/ops/${opId}/send`, formData(form));
+      toast("已送出");
+      refresh();
+    },
+  });
+}
+
+// 報工：這次做好幾件（累計到工單數量會自動完成這道工序）
+function reportForm(opId, isBack, afterDone) {
+  modal({
+    title: isBack ? "外包回廠" : "報工",
+    ok: "確認",
+    body: `<div class="fields">
+      ${field(isBack ? "回廠良品數" : "這次完成良品數", "good_qty", "", 'type="number" step="any" min="0" required inputmode="decimal"')}
+      ${field("不良數", "scrap_qty", "0", 'type="number" step="any" min="0" inputmode="decimal"')}
+      <label class="wide"><span><input type="checkbox" name="finish" value="1" style="width:auto" ${isBack ? "checked" : ""}> 這道工序全部做完了</span></label>
+    </div>`,
+    onSubmit: async (form) => {
+      const d = formData(form);
+      const r = await api("POST", `/api/ops/${opId}/report`, { ...d, finish: d.finish ? 1 : 0 });
+      toast(r.op_done ? "這道工序完成 ✔" : "已回報");
+      if (r.all_done) {
+        setTimeout(() => {
+          if (confirm("這張工單的工序都完成了，要現在完工入庫嗎？")) showWorkOrder(r.wo_id);
+          else refresh();
+        }, 100);
+      } else if (afterDone) afterDone(); else refresh();
+    },
+  });
+}
+
+// ---------------------------------------------------------------- 現場報工（手機 / 平板）
+
+views.floor = async () => {
+  let pick = "";
+  try { pick = localStorage.getItem("floor-machine") || ""; } catch (e) {}
+  const first = await api("GET", "/api/floor?machine_id=" + encodeURIComponent(pick));
+  if (!pick && first.machines.length) {
+    pick = String(first.machines[0].id);
+  }
+  const d = pick ? await api("GET", "/api/floor?machine_id=" + encodeURIComponent(pick)) : first;
+  const isOut = pick === "outsource";
+  app.innerHTML = `
+    <h1>現場報工</h1>
+    <div class="chips">
+      ${d.machines.map((m) => `<a class="chip ${String(m.id) === pick ? "on" : ""}" data-m="${m.id}">${esc(m.name)} ${m.count}</a>`).join("")}
+      <a class="chip ${isOut ? "on" : ""}" data-m="outsource">🚚 外包 ${d.outsource_count}</a>
+    </div>
+    ${!d.machines.length ? '<div class="card">還沒有設定機台，請到「排程」→「機台設定」新增。</div>' : ""}
+    ${d.queue.map((o, i) => `<div class="card floorcard ${i === 0 ? "first" : ""} ${o.late ? "late" : ""}">
+      <div class="optop"><span class="muted">${i === 0 ? "▶ 現在做" : `第 ${i + 1} 順位`}</span><span>${opBadges(o)}</span></div>
+      <div class="big">${esc(o.item_name)} <span class="muted">${esc(o.code)}</span></div>
+      <div>${o.drawing_no ? `圖號 <b>${esc(o.drawing_no)}</b> ${esc(o.revision || "")}　` : ""}${o.material ? `材質 <b>${esc(o.material)}</b>　` : ""}工單 ${esc(o.wo_no)}</div>
+      <div class="progress-row"><div class="progress"><div style="width:${Math.min(100, (o.good_qty / o.wo_qty) * 100)}%"></div></div>
+        <b>${n(o.good_qty)} / ${n(o.wo_qty)}</b></div>
+      <div class="steps">${o.ops.map((s) => `<span class="step ${s.status} ${s.seq === o.seq ? "cur" : ""}">${s.seq}. ${esc(s.process)}</span>`).join("")}</div>
+      <div class="small muted">${o.due_date ? `交期 ${esc(o.due_date)}　` : ""}預估完成 ${esc(o.est_finish)}${o.customer ? "　" + esc(o.customer) : ""}</div>
+      ${o.wo_note ? `<div class="small">📝 ${esc(o.wo_note)}</div>` : ""}
+      ${o.files.length ? gallery(o.files) : ""}
+      <div class="floorbtns">
+        ${isOut ? (o.sent_date ? `<button type="button" data-back="${o.id}">✔ 已回廠</button>` : `<button type="button" data-send="${o.id}">🚚 送外包</button>`)
+          : `${o.status === "todo" ? `<button type="button" class="ghost" data-start="${o.id}">▶ 開始</button>` : ""}
+             <button type="button" data-report="${o.id}">✔ 報工</button>`}
+      </div></div>`).join("") || (d.machines.length ? '<div class="card"><p class="empty">這台機台目前沒有排定的工作 👍</p></div>' : "")}`;
+  $$("[data-m]").forEach((a) => (a.onclick = () => {
+    try { localStorage.setItem("floor-machine", a.dataset.m); } catch (e) {}
+    refresh();
+  }));
+  $$("[data-start]").forEach((b) => (b.onclick = async () => {
+    try { await api("POST", `/api/ops/${b.dataset.start}/start`); toast("開始加工"); refresh(); } catch (e) { alert(e.message); }
+  }));
+  $$("[data-report]").forEach((b) => (b.onclick = () => reportForm(b.dataset.report, false)));
+  $$("[data-send]").forEach((b) => (b.onclick = () => sendOutForm(b.dataset.send)));
+  $$("[data-back]").forEach((b) => (b.onclick = () => reportForm(b.dataset.back, true)));
+};
+
+// ---- 製程路線編輯（品項的預設路線、工單的工序共用）
+
+async function routeEditor({ title, ops, onSave, hint }) {
+  const [machines, vendors] = await Promise.all([api("GET", "/api/machines"), api("GET", "/api/partners?type=supplier")]);
+  const row = (o = {}) => `<tr>
+    <td><input name="process" value="${esc(o.process || "")}" list="dl-proc" placeholder="例：CNC 車床" style="min-width:110px"></td>
+    <td><label class="inline"><input type="checkbox" name="outsource" ${o.outsource ? "checked" : ""} style="width:auto"> 外包</label></td>
+    <td><select name="machine_id" ${o.outsource ? "hidden" : ""}><option value="">（未排）</option>${machines.map((m) =>
+      `<option value="${m.id}" ${m.id === o.machine_id ? "selected" : ""}>${esc(m.name)}</option>`).join("")}</select>
+      <select name="vendor_id" ${o.outsource ? "" : "hidden"}><option value="">（廠商）</option>${vendors.map((v) =>
+      `<option value="${v.id}" ${v.id === o.vendor_id ? "selected" : ""}>${esc(pname(v))}</option>`).join("")}</select></td>
+    <td><input name="setup_min" type="number" step="any" min="0" value="${o.setup_min || ""}" placeholder="架機分" style="width:80px"></td>
+    <td><input name="cycle_min" type="number" step="any" min="0" value="${o.cycle_min || ""}" placeholder="分/件" style="width:80px"></td>
+    <td><input name="days" type="number" step="any" min="0" value="${o.days || ""}" placeholder="外包天" style="width:70px"></td>
+    <td style="white-space:nowrap"><button type="button" class="small ghost up">↑</button><button type="button" class="small ghost rm">✕</button></td></tr>`;
+  modal({
+    title,
+    body: `${hint ? `<p class="muted">${hint}</p>` : ""}
+      <div class="table-wrap"><table class="lines"><thead><tr><th>工序</th><th></th><th>機台 / 外包廠</th><th>架機(分)</th><th>工時(分/件)</th><th>外包天數</th><th></th></tr></thead>
+      <tbody id="rrows">${(ops.length ? ops : [{}]).map(row).join("")}</tbody></table></div>
+      <button type="button" class="small ghost" id="radd">＋ 加一道工序</button>
+      ${datalist("dl-proc", ["下料", "CNC 車床", "CNC 銑床", "綜合加工", "車銑複合", "線割", "放電", "鑽孔攻牙", "研磨", "熱處理", "表面處理", "去毛邊", "檢驗", "包裝"])}`,
+    onOpen: () => {
+      const wire = () => $$("#rrows tr").forEach((tr) => {
+        $(".rm", tr).onclick = () => tr.remove();
+        $(".up", tr).onclick = () => tr.previousElementSibling && tr.parentNode.insertBefore(tr, tr.previousElementSibling);
+        $("[name=outsource]", tr).onchange = (e) => {
+          $("[name=machine_id]", tr).hidden = e.target.checked;
+          $("[name=vendor_id]", tr).hidden = !e.target.checked;
+        };
+        $("[name=process]", tr).onchange = (e) => {
+          if (/熱處理|表面處理|電鍍|陽極|外包/.test(e.target.value) && !$("[name=outsource]", tr).checked) {
+            $("[name=outsource]", tr).checked = true;
+            $("[name=outsource]", tr).onchange({ target: { checked: true } });
+          }
+        };
+      });
+      $("#radd").onclick = () => { $("#rrows").insertAdjacentHTML("beforeend", row()); wire(); };
+      wire();
+    },
+    onSubmit: async () => {
+      const list = $$("#rrows tr").map((tr) => ({
+        process: $("[name=process]", tr).value, outsource: $("[name=outsource]", tr).checked ? 1 : 0,
+        machine_id: $("[name=machine_id]", tr).value, vendor_id: $("[name=vendor_id]", tr).value,
+        setup_min: $("[name=setup_min]", tr).value, cycle_min: $("[name=cycle_min]", tr).value, days: $("[name=days]", tr).value,
+      })).filter((o) => o.process.trim());
+      await onSave(list);
+    },
+  });
+}
 
 // ---------------------------------------------------------------- 凌越備份轉入
 
@@ -1315,8 +1953,49 @@ function wireLingyue() {
 }
 
 views.tools = async () => {
+  const st = await api("GET", "/api/settings");
+  const days = "一二三四五六日";
   app.innerHTML = `
-    <h1>備份 / 匯出 / 匯入</h1>
+    <h1>設定 / 匯入 / 備份</h1>
+    <div class="grid">
+      <div class="card"><h3>🏢 公司資料（印在報價單上）</h3>
+        <form id="set-company" class="fields">
+          ${field("公司名稱", "company_name", st.company_name)}
+          ${field("統一編號", "company_tax_id", st.company_tax_id)}
+          ${field("電話", "company_phone", st.company_phone)}
+          ${field("傳真", "company_fax", st.company_fax)}
+          ${field("地址", "company_address", st.company_address, "", true)}
+          <label class="wide">報價單條款<textarea name="quote_terms" rows="3">${esc(st.quote_terms || "1. 以上報價未含營業稅。\n2. 交期自確認訂單及收到正式圖面起算。")}</textarea></label>
+          <div class="wide"><button type="submit">儲存</button></div>
+        </form></div>
+      <div class="card"><h3>⏱️ 報價與排程</h3>
+        <form id="set-prod" class="fields">
+          ${field("加工工時費率（元 / 小時）", "hourly_rate", st.hourly_rate, 'type="number" step="any" min="0"')}
+          <label class="wide">工作日（排程估算用）<span class="daypick">${[...days].map((c, i) =>
+            `<label class="inline"><input type="checkbox" value="${i + 1}" ${st.workdays.includes(String(i + 1)) ? "checked" : ""} style="width:auto"> ${c}</label>`).join("")}</span></label>
+          <div class="wide"><button type="submit">儲存</button> <button type="button" class="ghost" id="set-mach">⚙️ 機台設定</button></div>
+        </form></div>
+      <div class="card"><h3>🔒 登入密碼 ${st.password_set ? '<span class="tag ok">已設定</span>' : '<span class="tag danger">未設定</span>'}</h3>
+        <p class="muted">${st.password_set ? "其他電腦 / 手機連線時要輸入密碼（每台裝置 30 天內免重登）。"
+          : "目前任何連得到這台電腦的人都能看到資料。<b>要在外面用手機連線，一定要先設密碼。</b>"}</p>
+        <form id="set-pw" class="fields">
+          ${st.password_set ? field("目前密碼", "old_password", "", 'type="password" autocomplete="current-password"') : ""}
+          ${field(st.password_set ? "新密碼（留空 = 取消密碼）" : "設定密碼（至少 4 個字）", "new_password", "", 'type="password" autocomplete="new-password"')}
+          <div class="wide"><button type="submit">${st.password_set ? "變更密碼" : "設定密碼"}</button></div>
+        </form>
+        <p class="muted small">忘記密碼：在系統電腦上執行 <code>python server.py --reset-password</code>。</p></div>
+      <div class="card"><h3>📱 在外面用手機</h3>
+        <p>建議用免費的 <b>Tailscale</b> 建立私人連線（不用設定路由器、不會把系統公開到網路上）：</p>
+        <ol class="small">
+          <li>先在左邊<b>設定登入密碼</b>。</li>
+          <li>在跑系統的電腦和你的手機都安裝 Tailscale（tailscale.com，Windows / iPhone / Android 都有），用同一個帳號登入。</li>
+          <li>用 <code>start.bat</code> 啟動系統（已開放連線）。</li>
+          <li>手機打開 Tailscale App，找到那台電腦的位址（100.x.x.x），用瀏覽器開 <code>http://100.x.x.x:8080</code>。</li>
+          <li>在瀏覽器選「加入主畫面」，以後就像 App 一樣點開。</li>
+        </ol>
+        <p class="muted small">在工廠內用 Wi-Fi 的話，直接開 <code>http://這台電腦的IP:8080</code> 即可。</p></div>
+    </div>
+    <h2 class="section">匯入 / 備份</h2>
     <div class="card" id="ly-card"><h3>⭐ 從凌越備份檔一次轉入（建議）</h3>
       <p>在凌越做一次「備份」，會產生 <code>wstkBKUP.001</code> 這種檔案。把它交給系統，
         <b>客戶、廠商、產品、目前庫存、所有過去的進銷貨紀錄</b>一次轉進來。先預覽、確認後才寫入；重複轉入不會重複。</p>
@@ -1351,13 +2030,33 @@ views.tools = async () => {
       <div id="imp-result"></div>
     </div>
     <div class="card"><h3>💾 備份資料庫</h3>
-      <p>所有資料都在一個檔案裡。建議<b>每天下班前按一次</b>，把檔案存到隨身碟或雲端硬碟。</p>
+      <p>建議<b>每天下班前按一次</b>，把檔案存到隨身碟或雲端硬碟。</p>
       <a class="btn" href="/api/backup">下載備份檔</a>
-      <p class="muted">還原方式：關閉系統 → 把備份檔改名為 <code>cnc.db</code> 覆蓋程式資料夾中的同名檔案 → 重新啟動。</p></div>
+      <p class="muted">備份檔是一個 zip，裡面有資料庫 <code>cnc.db</code> 和所有圖面（<code>files</code> 資料夾）。
+        還原：關閉系統 → 解壓縮，把 <code>cnc.db</code> 和 <code>files</code> 放回程式資料夾（覆蓋）→ 重新啟動。</p></div>
     <div class="card"><h3>📊 匯出庫存表（Excel 可開）</h3>
       <p>包含料號、品名、目前庫存、成本與庫存金額，可用來給會計或月底盤點。</p>
       <a class="btn" href="/api/export/stock.csv">下載庫存 CSV</a></div>`;
 
+  const saveForm = (id, extra) => ($("#" + id).onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      await api("PUT", "/api/settings", { ...formData(e.target), ...(extra ? extra() : {}) });
+      toast("已儲存");
+    } catch (err) { alert(err.message); }
+  });
+  saveForm("set-company");
+  saveForm("set-prod", () => ({ workdays: $$(".daypick input:checked").map((c) => c.value).join("") }));
+  $("#set-mach").onclick = () => machineManager();
+  $("#set-pw").onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api("POST", "/api/settings/password", formData(e.target));
+      toast(r.password_set ? "已設定密碼" : "已取消密碼");
+      if (r.password_set) await showLogin();
+      refresh();
+    } catch (err) { alert(err.message); }
+  };
   $("#ly-path").placeholder = "例：\\\\YHH\\homes\\HSU_HOME\\公司\\wstkBKUP.001";
   wireLingyue();
   const imp = { file: null, data: null, mapping: null, header_row: null };

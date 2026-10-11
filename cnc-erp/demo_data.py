@@ -50,6 +50,27 @@ def load_demo(path=None):
             server.deliver_order(conn, so1["id"], dict(lines=[dict(line_id=order1["lines"][0]["id"], qty=30)]))
             server.add_payment(conn, so1["id"], dict(amount=5000, note="訂金"))
 
+            # 機台、外包廠、製程路線（開工單時自動帶入工序）
+            import production
+            import quotes
+            heat = server.create_partner(conn, dict(type="supplier", name="新光熱處理廠", short_name="新光熱處理",
+                                                    grp="外包熱處理", phone="04-2355-1234"))["id"]
+            m = {name: production.save_machine(conn, dict(name=name, kind=kind, daily_hours=h))["id"]
+                 for name, kind, h in [("CNC-01 車床", "車床", 10), ("CNC-02 車床", "車床", 8),
+                                       ("CNC-05 綜合加工機", "綜合加工", 16), ("線割機", "線割", 8)]}
+            production.save_routes(conn, ids["FG-SHAFT-001"], {"ops": [
+                dict(process="CNC 車床", machine_id=m["CNC-02 車床"], setup_min=40, cycle_min=2.5),
+                dict(process="熱處理", outsource=1, vendor_id=heat, days=4),
+                dict(process="檢驗", machine_id=m["CNC-01 車床"], cycle_min=0.3)]})
+            production.save_routes(conn, ids["FG-FLANGE-002"], {"ops": [
+                dict(process="CNC 銑床", machine_id=m["CNC-05 綜合加工機"], setup_min=60, cycle_min=35),
+                dict(process="陽極處理", outsource=1, vendor_id=heat, days=3)]})
+            q1 = quotes.create_quote(conn, dict(partner_id=cus, category="車床件", reply_by=d(2), note="客戶 LINE 傳來的圖面", lines=[
+                dict(part_name="連接軸", drawing_no="YF-3302", revision="A", material="S45C", finish="鍍鎳", qty=300,
+                     material_cost=35, cycle_min=4, setup_min=45, outsource_cost=12, margin_pct=25, lead_days=14)]))
+            quotes.create_quote(conn, dict(customer_name="宏昌自動化（新客戶）", category="銑床件", lines=[
+                dict(part_name="馬達座", drawing_no="HC-118", material="AL6061", finish="陽極處理", qty=20,
+                     material_cost=180, cycle_min=25, setup_min=90, outsource_cost=40, margin_pct=30, unit_price=1150, lead_days=10)]))
             wo = server.create_work_order(conn, dict(item_id=ids["FG-SHAFT-001"], qty=200, sales_order_id=so1["id"],
                                                      machine="CNC-02 車床", due_date=d(4), materials=[
                                                          dict(item_id=ids["RM-AL6061-D30"], qty_per_unit=0.05)]))

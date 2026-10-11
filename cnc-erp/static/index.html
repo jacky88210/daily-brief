@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CNC 進銷存</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E⚙️%3C/text%3E%3C/svg%3E">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1f5fa8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="CNC 進銷存">
+<link rel="apple-touch-icon" href="icon.svg">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,14 +17,16 @@
   <div class="brand">CNC 進銷存</div>
   <nav id="nav">
     <a data-view="dashboard">總覽</a>
+    <a data-view="quotes">報價</a>
     <a data-view="sales">銷貨訂單</a>
     <a data-view="workorders">生產工單</a>
+    <a data-view="schedule">排程</a>
+    <a data-view="floor">現場報工</a>
     <a data-view="purchase">採購進貨</a>
     <a data-view="items">庫存品項</a>
-    <a data-view="moves">庫存異動</a>
     <a data-view="partners">客戶/廠商</a>
     <a data-view="history">歷史查詢</a>
-    <a data-view="tools">匯入/備份</a>
+    <a data-view="tools">設定/匯入</a>
   </nav>
 </header>
 <main id="app"></main>
@@ -35,6 +42,22 @@
     </div>
   </form>
 </dialog>
+<dialog id="login">
+  <form id="login-form">
+    <h2>🔒 請登入</h2>
+    <p class="muted">這套系統設有密碼。登入後這台裝置 30 天內不用再輸入。</p>
+    <input type="password" id="login-pw" placeholder="密碼" autocomplete="current-password" required>
+    <p class="error" id="login-error"></p>
+    <div class="actions"><button type="submit">登入</button></div>
+  </form>
+</dialog>
+<nav class="mobilebar">
+  <a data-view="dashboard"><span>🏠</span>總覽</a>
+  <a data-view="quotes"><span>📐</span>報價</a>
+  <a data-view="floor"><span>🛠️</span>報工</a>
+  <a data-view="schedule"><span>📅</span>排程</a>
+  <a data-view="history"><span>🔍</span>查詢</a>
+</nav>
 <div id="toast"></div>
 <script src="app.js"></script>
 </body>

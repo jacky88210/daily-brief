@@ -1,0 +1,9 @@
+{
+  "name": "CNC 進銷存",
+  "short_name": "CNC 進銷存",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f5f7",
+  "theme_color": "#1f5fa8",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

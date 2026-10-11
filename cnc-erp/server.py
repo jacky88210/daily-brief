@@ -129,6 +129,8 @@ CREATE TABLE IF NOT EXISTS history (
 );
 CREATE INDEX IF NOT EXISTS idx_history_partner ON history(partner_id);
 CREATE INDEX IF NOT EXISTS idx_history_item ON history(item_code);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, created TEXT NOT NULL, last_seen TEXT NOT NULL, client TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_moves_item ON stock_moves(item_id);
 CREATE INDEX IF NOT EXISTS idx_lines_order ON order_lines(order_id);
 """
@@ -170,12 +172,17 @@ def connect(path=None):
 def init_db(path=None):
     conn = connect(path)
     try:
+        import production
+        import quotes
         conn.executescript(SCHEMA)
+        conn.executescript(quotes.SCHEMA)
+        conn.executescript(production.SCHEMA)
         for table, cols in MIGRATIONS.items():
             have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             for col, decl in cols:
                 if col not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        production.ensure_ops(conn)
         conn.commit()
     finally:
         conn.close()
@@ -183,6 +190,97 @@ def init_db(path=None):
 
 def today():
     return date.today().isoformat()
+
+
+# ---------------------------------------------------------------- 設定與登入
+
+PUBLIC_SETTINGS = ["company_name", "company_address", "company_phone", "company_fax", "company_tax_id",
+                   "hourly_rate", "workdays", "quote_terms"]
+
+
+def get_setting(conn, key, default=""):
+    r = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return r[0] if r and r[0] is not None else default
+
+
+def set_setting(conn, key, value):
+    conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                 (key, value))
+
+
+def get_settings(conn, q=None):
+    out = {k: get_setting(conn, k) for k in PUBLIC_SETTINGS}
+    out["hourly_rate"] = out["hourly_rate"] or "800"
+    out["workdays"] = out["workdays"] or "123456"
+    out["password_set"] = bool(get_setting(conn, "password_hash"))
+    return out
+
+
+def save_settings(conn, body):
+    for k in PUBLIC_SETTINGS:
+        if k in body:
+            if k == "hourly_rate":
+                num(body[k] or 0, "工時費率", 0)
+            set_setting(conn, k, str(body[k]).strip())
+    return {"ok": True}
+
+
+def _hash_password(password, salt=None):
+    import hashlib
+    import secrets
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+    return f"pbkdf2${salt}${digest}"
+
+
+def check_password(conn, password):
+    import hmac
+    stored = get_setting(conn, "password_hash")
+    if not stored:
+        return True
+    try:
+        _, salt, _ = stored.split("$")
+    except ValueError:
+        return False
+    return hmac.compare_digest(_hash_password(password or "", salt), stored)
+
+
+def set_password(conn, body):
+    """設定或變更登入密碼。已經有密碼時要輸入舊密碼。新密碼留空 = 取消密碼。"""
+    if get_setting(conn, "password_hash") and not check_password(conn, body.get("old_password", "")):
+        raise ApiError("舊密碼不正確", 403)
+    new = body.get("new_password") or ""
+    if new and len(new) < 4:
+        raise ApiError("密碼至少 4 個字")
+    set_setting(conn, "password_hash", _hash_password(new) if new else "")
+    conn.execute("DELETE FROM sessions")
+    return {"ok": True, "password_set": bool(new)}
+
+
+SESSION_DAYS = 30
+
+
+def new_session(conn, client=""):
+    import secrets
+    from datetime import datetime
+    token = secrets.token_urlsafe(32)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    conn.execute("INSERT INTO sessions (token, created, last_seen, client) VALUES (?,?,?,?)", (token, now, now, client))
+    return token
+
+
+def valid_session(conn, token):
+    from datetime import datetime
+    if not token:
+        return False
+    r = conn.execute("SELECT last_seen FROM sessions WHERE token = ?", (token,)).fetchone()
+    if not r:
+        return False
+    if r[0] < _plus_days(today(), -SESSION_DAYS):
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        return False
+    conn.execute("UPDATE sessions SET last_seen = ? WHERE token = ?", (datetime.now().strftime("%Y-%m-%d %H:%M"), token))
+    return True
 
 
 def rows(cur):
@@ -301,7 +399,10 @@ def item_detail(conn, item_id):
            FROM order_lines l JOIN orders o ON o.id = l.order_id JOIN partners p ON p.id = o.partner_id
            WHERE l.item_id = ? AND o.status IN ('open', 'partial') ORDER BY o.due_date""", (item_id,)))
     wos = rows(conn.execute(WO_SQL + " WHERE w.item_id = ? AND w.status IN ('pending', 'in_progress')", (item_id,)))
-    return {"item": it, "history": hist, "partners": buyers, "open_lines": open_lines, "work_orders": wos}
+    import production
+    files = rows(conn.execute("SELECT * FROM files WHERE owner_type = 'item' AND owner_id = ? ORDER BY id", (item_id,)))
+    return {"item": it, "history": hist, "partners": buyers, "open_lines": open_lines, "work_orders": wos,
+            "files": files, "routes": production.get_routes(conn, item_id)}
 
 
 def clean_item(body):
@@ -590,6 +691,11 @@ def get_work_order(conn, wid):
         """SELECT m.*, i.code, i.name, i.unit, COALESCE((SELECT SUM(qty) FROM stock_moves s
                WHERE s.item_id = m.item_id), 0) AS stock
            FROM wo_materials m JOIN items i ON i.id = m.item_id WHERE m.wo_id = ?""", (wid,)))
+    import production
+    w["ops"] = production.wo_ops(conn, wid)
+    w["files"] = rows(conn.execute(
+        """SELECT * FROM files WHERE (owner_type = 'item' AND owner_id = ?) OR (owner_type = 'workorder' AND owner_id = ?)
+           ORDER BY id""", (w["item_id"], wid)))
     return w
 
 
@@ -611,6 +717,8 @@ def create_work_order(conn, body):
             continue
         conn.execute("INSERT INTO wo_materials (wo_id, item_id, qty_per_unit) VALUES (?,?,?)",
                      (cur.lastrowid, mid, num(m.get("qty_per_unit"), "每件用量", 0)))
+    import production
+    production.create_ops(conn, cur.lastrowid, body.get("ops"))
     return {"id": cur.lastrowid, "no": no}
 
 
@@ -931,19 +1039,25 @@ def dashboard_trends(conn, t):
             FROM ({sales}) WHERE doc_date >= ? AND item_code != ''
             GROUP BY item_code HAVING times >= 3 ORDER BY times DESC LIMIT 10""",
         (_plus_days(t, -730),)))
-    machines = rows(conn.execute(
-        """SELECT COALESCE(NULLIF(w.machine, ''), '（未指定機台）') AS machine, COUNT(*) AS orders,
-                  SUM(w.qty) AS qty, SUM(w.qty * COALESCE(i.cycle_min, 0)) / 60.0 AS hours,
-                  SUM(CASE WHEN COALESCE(i.cycle_min, 0) = 0 THEN 1 ELSE 0 END) AS no_cycle,
-                  MIN(NULLIF(w.due_date, '')) AS next_due
-           FROM work_orders w JOIN items i ON i.id = w.item_id
-           WHERE w.status IN ('pending', 'in_progress') GROUP BY 1 ORDER BY hours DESC"""))
+    import production
+    import quotes
+    sch = production.schedule(conn)
+    machines = [{"id": m["id"], "machine": m["name"], "orders": len(m["queue"]), "hours": m["load_hours"],
+                 "free_date": m["free_date"], "late": m["late"],
+                 "no_cycle": sum(1 for o in m["queue"] if not o["cycle_min"])}
+                for m in sch["machines"] if m["queue"]]
+    if sch["unassigned"]:
+        machines.append({"id": None, "machine": "（未排機台）", "orders": len(sch["unassigned"]),
+                         "hours": round(sum(o["remaining_hours"] for o in sch["unassigned"]), 1),
+                         "free_date": "", "late": 0, "no_cycle": 0})
     return {
         "months": [{"month": m, "amount": by_month.get(m, 0),
                     "last_year": last_year_same.get(f"{int(m[:4]) - 1}{m[4:]}", 0)} for m in months],
         "ytd": ytd, "last_ytd": last_ytd,
         "top_customers": top, "total_12m": total_12m,
         "dormant": dormant, "repeat_parts": repeat, "machines": machines,
+        "late_work_orders": [w for w in sch["work_orders"] if w["late"]],
+        "outsource": sch["outsource"], "quotes": quotes.quote_stats(conn),
     }
 
 
@@ -966,6 +1080,8 @@ def export_stock_csv(conn):
 
 
 def backup_bytes():
+    """備份：資料庫 + 圖面附件（files 資料夾），打包成一個 zip。"""
+    import zipfile
     fd, tmp = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -974,8 +1090,15 @@ def backup_bytes():
         src.backup(dst)
         dst.close()
         src.close()
-        with open(tmp, "rb") as f:
-            return f.read()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(tmp, "cnc.db")
+            files_root = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "files")
+            for root, _, names in os.walk(files_root):
+                for name in names:
+                    full = os.path.join(root, name)
+                    z.write(full, os.path.join("files", os.path.relpath(full, files_root)), zipfile.ZIP_STORED)
+        return buf.getvalue()
     finally:
         os.remove(tmp)
 
@@ -1039,14 +1162,44 @@ ROUTES = [
     ("POST", r"/api/stock/adjust", lambda c, q, b: adjust_stock(c, b)),
     ("GET", r"/api/history", lambda c, q, b: list_history(c, q)),
     ("GET", r"/api/last-prices", lambda c, q, b: last_prices(c, q)),
+    ("GET", r"/api/settings", lambda c, q, b: get_settings(c, q)),
+    ("PUT", r"/api/settings", lambda c, q, b: save_settings(c, b)),
+    ("POST", r"/api/settings/password", lambda c, q, b: set_password(c, b)),
+    ("GET", r"/api/files", lambda c, q, b: _m("quotes").list_files(c, q.get("owner_type"), q.get("owner_id") or 0)),
+    ("DELETE", r"/api/files/(\d+)", lambda c, q, b, i: _m("quotes").delete_file(c, int(i))),
+    ("GET", r"/api/quotes", lambda c, q, b: _m("quotes").list_quotes(c, q)),
+    ("POST", r"/api/quotes", lambda c, q, b: _m("quotes").create_quote(c, b)),
+    ("GET", r"/api/quotes/(\d+)", lambda c, q, b, i: _m("quotes").get_quote(c, int(i))),
+    ("PUT", r"/api/quotes/(\d+)", lambda c, q, b, i: _m("quotes").update_quote(c, int(i), b)),
+    ("POST", r"/api/quotes/(\d+)/status", lambda c, q, b, i: _m("quotes").set_status(c, int(i), b)),
+    ("POST", r"/api/quotes/(\d+)/convert", lambda c, q, b, i: _m("quotes").convert_to_order(c, int(i), b)),
+    ("GET", r"/api/machines", lambda c, q, b: _m("production").list_machines(c, q)),
+    ("POST", r"/api/machines", lambda c, q, b: _m("production").save_machine(c, b)),
+    ("PUT", r"/api/machines/(\d+)", lambda c, q, b, i: _m("production").save_machine(c, b, int(i))),
+    ("DELETE", r"/api/machines/(\d+)", lambda c, q, b, i: _m("production").delete_machine(c, int(i))),
+    ("GET", r"/api/items/(\d+)/routes", lambda c, q, b, i: _m("production").get_routes(c, int(i))),
+    ("PUT", r"/api/items/(\d+)/routes", lambda c, q, b, i: _m("production").save_routes(c, int(i), b)),
+    ("PUT", r"/api/workorders/(\d+)/ops", lambda c, q, b, i: {"count": _m("production").create_ops(c, int(i), b.get("ops"))}),
+    ("GET", r"/api/schedule", lambda c, q, b: _m("production").schedule(c, q)),
+    ("GET", r"/api/floor", lambda c, q, b: _m("production").floor_queue(c, q)),
+    ("POST", r"/api/ops/(\d+)/start", lambda c, q, b, i: _m("production").start_op(c, int(i))),
+    ("POST", r"/api/ops/(\d+)/report", lambda c, q, b, i: _m("production").report_op(c, int(i), b)),
+    ("POST", r"/api/ops/(\d+)/send", lambda c, q, b, i: _m("production").send_out(c, int(i), b)),
+    ("POST", r"/api/ops/(\d+)/move", lambda c, q, b, i: _m("production").move_op(c, int(i), b)),
+    ("PUT", r"/api/ops/(\d+)", lambda c, q, b, i: _m("production").update_op(c, int(i), b)),
     ("POST", r"/api/lingyue/preview", lambda c, q, b: lingyue_preview(c, b)),
     ("POST", r"/api/lingyue/import", lambda c, q, b: lingyue_import(c, b)),
     ("POST", r"/api/import", lambda c, q, b: __import__("importer").run_import(c, b)),
 ]
 ROUTES = [(m, re.compile("^" + p + "$"), fn) for m, p, fn in ROUTES]
 
+
+def _m(name):
+    import importlib
+    return importlib.import_module(name)
+
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
-                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".json": "application/manifest+json", ".png": "image/png"}
 
 
 def handle_api(method, path, query, body):
@@ -1077,15 +1230,99 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (headers or {}).items():
+        headers = dict(headers or {})
+        self.send_header("Cache-Control", headers.pop("Cache-Control", "no-store"))
+        for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
+    def _cookie(self, name):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return ""
+
+    def _read_body(self, limit):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > limit:
+            raise ApiError("檔案太大")
+        data = bytearray()
+        while len(data) < length:
+            chunk = self.rfile.read(min(length - len(data), 1 << 20))
+            if not chunk:
+                break
+            data += chunk
+        return bytes(data)
+
+    def _auth(self, url, method):
+        """回傳 None 表示可以繼續；否則回傳要送出的 (status, payload, headers)。"""
+        conn = connect()
+        try:
+            with conn:
+                required = bool(get_setting(conn, "password_hash"))
+                token = self._cookie("cnc_session")
+                if url.path == "/api/auth/status":
+                    ok = not required or valid_session(conn, token)
+                    return 200, {"required": required, "logged_in": ok}, {}
+                if url.path == "/api/auth/login" and method == "POST":
+                    try:
+                        body = json.loads(self._read_body(10000).decode("utf-8") or "{}")
+                    except ValueError:
+                        body = {}
+                    if not check_password(conn, body.get("password", "")):
+                        return 403, {"error": "密碼不正確"}, {}
+                    tok = new_session(conn, self.client_address[0])
+                    return 200, {"ok": True}, {"Set-Cookie": f"cnc_session={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}"}
+                if url.path == "/api/auth/logout":
+                    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                    return 200, {"ok": True}, {"Set-Cookie": "cnc_session=; Path=/; Max-Age=0"}
+                if required and not valid_session(conn, token):
+                    return 401, {"error": "請先登入", "login": True}, {}
+        finally:
+            conn.close()
+        return None
+
     def _dispatch(self, method):
         url = urlparse(self.path)
         query = {k: v[0] for k, v in parse_qs(url.query).items()}
+        if url.path.startswith("/api/"):
+            denied = self._auth(url, method)
+            if denied:
+                status, payload, headers = denied
+                return self._send(status, payload, headers=headers)
+        if url.path == "/api/files/upload" and method == "POST":
+            import quotes
+            try:
+                data = self._read_body(quotes.MAX_FILE)
+                conn = connect()
+                try:
+                    with conn:
+                        r = quotes.save_file(conn, query.get("owner_type", ""), int(query.get("owner_id") or 0),
+                                             query.get("name") or "file", data, query.get("note", ""))
+                finally:
+                    conn.close()
+                return self._send(200, r)
+            except ApiError as e:
+                return self._send(e.status, {"error": str(e)})
+        m = re.match(r"^/api/files/(\d+)/raw$", url.path)
+        if m and method == "GET":
+            import quotes
+            from urllib.parse import quote as urlquote
+            conn = connect()
+            try:
+                rec, path = quotes.file_path(conn, int(m.group(1)))
+            except ApiError as e:
+                return self._send(e.status, {"error": str(e)})
+            finally:
+                conn.close()
+            with open(path, "rb") as f:
+                data = f.read()
+            disp = "attachment" if query.get("download") else "inline"
+            return self._send(200, data, rec["mime"] or "application/octet-stream", {
+                "Content-Disposition": f"{disp}; filename*=UTF-8''{urlquote(rec['filename'])}",
+                "Cache-Control": "private, max-age=86400"})
         if url.path == "/api/export/stock.csv":
             conn = connect()
             try:
@@ -1095,8 +1332,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, data, "text/csv; charset=utf-8", {
                 "Content-Disposition": f'attachment; filename="stock-{today()}.csv"'})
         if url.path == "/api/backup":
-            return self._send(200, backup_bytes(), "application/octet-stream", {
-                "Content-Disposition": f'attachment; filename="cnc-backup-{today()}.db"'})
+            return self._send(200, backup_bytes(), "application/zip", {
+                "Content-Disposition": f'attachment; filename="cnc-backup-{today()}.zip"'})
         if url.path == "/api/lingyue/upload" and method == "POST":
             # 備份檔可能有幾十 MB，直接收原始檔案存起來，再回傳預覽
             length = int(self.headers.get("Content-Length") or 0)
@@ -1159,8 +1396,17 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--lan", action="store_true", help="開放區網內其他電腦連線")
     ap.add_argument("--demo", action="store_true", help="資料庫是空的時候，放入示範資料")
+    ap.add_argument("--reset-password", action="store_true", help="忘記密碼時用：清除登入密碼")
     args = ap.parse_args()
     init_db()
+    if args.reset_password:
+        conn = connect()
+        with conn:
+            set_setting(conn, "password_hash", "")
+            conn.execute("DELETE FROM sessions")
+        conn.close()
+        print("已清除登入密碼，請重新啟動系統後到「設定」重新設定。")
+        return
     if args.demo:
         from demo_data import load_demo
         load_demo()
@@ -1169,6 +1415,11 @@ def main():
     print(f"CNC 進銷存系統已啟動：http://127.0.0.1:{args.port}  （資料庫：{DB_PATH}）")
     if args.lan:
         print("已開放區網連線，其他電腦請用這台電腦的 IP 位址加上 :%d 連線" % args.port)
+        conn = connect()
+        has_pw = bool(get_setting(conn, "password_hash"))
+        conn.close()
+        if not has_pw:
+            print("【注意】尚未設定登入密碼！同一個網路裡的人都能看到資料。請到「設定」頁設定密碼。")
     print("關閉此視窗即停止系統")
     try:
         srv.serve_forever()
