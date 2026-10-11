@@ -225,7 +225,7 @@ class HttpTest(Base):
         self.assertEqual(self.req("GET", "/api/dashboard")[0], 200)  # 沒設密碼前不用登入
         self.assertEqual(self.req("POST", "/api/settings/password", {"new_password": "1234"})[0], 200)
         self.assertEqual(self.req("GET", "/api/dashboard")[0], 401)
-        self.assertEqual(json.loads(self.req("GET", "/api/auth/status")[1]), {"required": True, "logged_in": False})
+        self.assertEqual(json.loads(self.req("GET", "/api/auth/status")[1]), {"required": True, "logged_in": False, "setup_needed": False})
         self.assertEqual(self.req("POST", "/api/auth/login", {"password": "wrong"})[0], 403)
         self.assertEqual(self.req("POST", "/api/auth/login", {"password": "1234"})[0], 200)
         self.assertTrue(self.cookie.startswith("cnc_session="))

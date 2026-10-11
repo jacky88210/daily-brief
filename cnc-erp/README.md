@@ -92,6 +92,48 @@
 - **紙張**：A4 直式 / 橫式、A5、**中一刀（9.5×5.5 吋連續報表紙）**，在「設定」選。
 - **一式多聯**：在「設定」填例如「第一聯 客戶聯,第二聯 存根聯」，每張單會依序各印一張並標上聯別。
 
+## 資料安全與備援（商業使用必讀）
+
+客戶圖面、報價、往來紀錄都是機密，請照下面設定：
+
+### 1. 密碼與存取
+- **一定要設定登入密碼**。沒設密碼前，只有系統電腦本身能用，其他電腦 / 手機連線時會被要求先設定密碼，看不到任何資料。
+- 同一個 IP 連續輸錯 5 次密碼，鎖 10 分鐘。
+- 「設定 → 存取紀錄」查得到誰（哪個 IP）什麼時候登入、登入失敗、下載備份。看到不認識的 IP 請立即換密碼。
+- **在外面使用只走 Tailscale**（私人加密連線），**不要在路由器開 port、不要用 DDNS / QuickConnect 把系統公開到網路上。**
+
+### 2. 雙備援（3-2-1 原則：3 份資料、2 種儲存設備、1 份異地）
+| 份 | 放哪裡 | 怎麼做 |
+|---|---|---|
+| 1 | 正在使用的資料庫 | 系統所在的電腦或 NAS |
+| 2 | **備份位置 1：NAS** | 「設定 → 自動備份」填 NAS 資料夾，每天自動備份並驗證可還原 |
+| 3 | **備份位置 2：另一個設備** | 外接硬碟或另一顆硬碟；系統每天同時寫一份 |
+| ＋ | **異地 / 加密** | 在 NAS 用 **Hyper Backup** 把備份資料夾**加密**備份到外接硬碟或 Synology C2（雲端），開啟版本保留 |
+
+- 每份備份寫完都會自動驗證（壓縮檔完整、資料庫能開、完整性檢查通過）；失敗會顯示在「設定」並寫入存取紀錄。
+- 一個位置故障（例如 NAS 沒開）不影響另一個位置繼續備份。
+- 每季至少做一次**還原演練**：拿一份備份在另一台電腦解壓縮、用 `demo.bat` 的方式開起來確認資料正確。
+- NAS 上放備份的共用資料夾，權限只開給老闆 / 管理者帳號；建議開啟 NAS 的資料夾加密。
+
+### 3. 資料庫放在哪裡
+- ❌ **不要**讓電腦上的系統直接讀寫放在 NAS 網路磁碟（`\\NAS\...`）上的資料庫，網路中斷或多人同時寫入時容易損毀。系統偵測到會在啟動時警告。
+- ✅ 做法 A：系統裝在**辦公室電腦**（資料在本機），每天自動備份到 NAS + 外接硬碟。
+- ✅ 做法 B：系統直接**裝在 NAS 上**（見下一節），電腦不用一直開機；再用 Hyper Backup 做第二、第三份。
+
+## 把系統裝在 Synology NAS 上（Container Manager）
+
+適用有「Container Manager」（舊名 Docker）套件的 Synology 機型（多數 + 系列、x86 機型）。
+
+1. 套件中心安裝 **Container Manager**。
+2. 把整個 `cnc-erp` 資料夾複製到 NAS，例如 `/docker/cnc-erp`（共用資料夾權限只給管理者）。
+3. Container Manager →「專案」→「新增」→ 路徑選 `cnc-erp` 資料夾 → 使用資料夾裡的 `docker-compose.yml` → 建立。
+4. 瀏覽器開 `http://NAS的IP:8080`，第一次會要求**設定密碼**。
+5. 資料庫與圖面存在 `cnc-erp/data` 資料夾裡（就是 NAS 上的實體資料夾）。把這個資料夾加進 **Hyper Backup**。
+6. 外面使用：套件中心安裝 **Tailscale**，手機也裝 Tailscale，用 `http://NAS的Tailscale位址:8080` 連線。
+7. 要從舊電腦搬過來：先停掉電腦上的系統，把 `cnc.db` 和 `files` 資料夾複製到 NAS 的 `cnc-erp/data` 裡，再啟動專案。
+
+容器內使用台灣時區；NAS 重開機後系統會自動啟動。
+
 ## 安裝（第一次，約 5 分鐘）
 
 1. 到 <https://www.python.org/downloads/> 下載 Python 並安裝。
@@ -185,7 +227,7 @@
 - 庫存不直接存數字，而是由 `stock_moves` 異動紀錄加總，所以任何數字都可追溯。
 - 匯入：`importer.py`（xlsx / csv / dbf 皆用標準函式庫解析，欄位別名在 `FIELDS`，遇到新的舊系統欄位名稱加進去即可）
 - 報價與附件：`quotes.py`；排程、製程、報工：`production.py`；出貨單、對帳單：`documents.py`
-- 測試：`python -m unittest test_server test_importer test_lingyue test_features test_workflow test_documents`
+- 測試：`python -m unittest test_server test_importer test_lingyue test_features test_workflow test_documents test_security`
 - 指令參數：`python server.py --port 8080 --lan --demo`；環境變數 `CNC_DB` 可指定資料庫位置。
 
 ## 之後可以再加的功能

@@ -23,28 +23,46 @@ async function api(method, path, body, retried) {
     await showLogin();
     return api(method, path, body, true);
   }
+  if (res.status === 403 && data.setup && !retried) {
+    await showLogin(true);
+    return api(method, path, body, true);
+  }
   if (!res.ok) throw new Error(data.error || "發生錯誤 (" + res.status + ")");
   return data;
 }
 
 // ---- 登入：設了密碼後，從其他電腦 / 手機連線都要先登入（30 天內免重登）
 let loginWaiters = null;
-function showLogin() {
+function showLogin(setup) {
   if (loginWaiters) return new Promise((r) => loginWaiters.push(r));
   loginWaiters = [];
   return new Promise((resolve) => {
     loginWaiters.push(resolve);
     const dlg = $("#login");
+    $("#login h2").textContent = setup ? "🔒 第一次使用：請設定密碼" : "🔒 請登入";
+    $("#login p.muted").textContent = setup
+      ? "為了保護客戶資料，從其他電腦或手機使用前，必須先設定一組密碼（至少 4 個字，建議 8 個字以上）。之後每台裝置都要輸入這組密碼。"
+      : "這套系統設有密碼。登入後這台裝置 30 天內不用再輸入。";
+    $("#login-pw2").hidden = !setup;
+    $("#login-pw2").required = !!setup;
     $("#login-error").textContent = "";
     $("#login-pw").value = "";
+    $("#login-pw2").value = "";
     dlg.showModal();
     setTimeout(() => $("#login-pw").focus(), 50);
     $("#login-form").onsubmit = async (e) => {
       e.preventDefault();
+      const pw = $("#login-pw").value;
+      if (setup) {
+        if (pw !== $("#login-pw2").value) return ($("#login-error").textContent = "兩次輸入的密碼不一樣");
+        const r = await fetch("/api/settings/password", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ new_password: pw }) });
+        if (!r.ok) return ($("#login-error").textContent = (await r.json().catch(() => ({}))).error || "設定失敗");
+      }
       const res = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: $("#login-pw").value }) });
+        body: JSON.stringify({ password: pw }) });
       if (!res.ok) {
-        $("#login-error").textContent = "密碼不正確";
+        $("#login-error").textContent = (await res.json().catch(() => ({}))).error || "密碼不正確";
         return;
       }
       dlg.close();
@@ -2271,6 +2289,23 @@ views.tools = async () => {
           <li>在瀏覽器選「加入主畫面」，以後就像 App 一樣點開。</li>
         </ol>
         <p class="muted small">在工廠內用 Wi-Fi 的話，直接開 <code>http://這台電腦的IP:8080</code> 即可。</p></div>
+      <div class="card"><h3>🛡️ 自動備份（雙備援）</h3>
+        <p class="muted">每天自動備份資料庫和所有圖面到<b>兩個不同地方</b>（例：NAS 資料夾 + 外接硬碟 / 另一顆硬碟），
+          寫完會自動驗證備份可以還原。任一處故障，另一處還有完整資料。</p>
+        <form id="set-backup" class="fields">
+          ${field("備份位置 1（建議 NAS）", "backup_dir", st.backup_dir, 'placeholder="例：\\\\YHH\\homes\\HSU_HOME\\公司\\系統備份"', true)}
+          ${field("備份位置 2（建議外接硬碟或另一顆硬碟）", "backup_dir2", st.backup_dir2, 'placeholder="例：E:\\系統備份"', true)}
+          ${field("保留最近幾天", "backup_keep", st.backup_keep, 'type="number" min="1" step="1"')}
+          <div class="wide"><button type="submit">儲存</button> <button type="button" class="ghost" id="backup-now">立即備份並驗證</button></div>
+        </form>
+        <div id="backup-status">${Object.entries(st.backup_status || {}).map(([d, b]) => `<div class="small">
+          ${b.ok ? '<span class="tag ok">正常</span>' : '<span class="tag danger">失敗</span>'} ${esc(b.time)}　${esc(d)}
+          ${b.ok ? `<span class="muted">（${n(Math.round((b.size || 0) / 1024))} KB）</span>` : `<br><span class="down">${esc(b.error)}</span>`}</div>`).join("")
+          || '<p class="small down">⚠️ 還沒設定自動備份。商業資料請至少設定兩個備份位置。</p>'}</div></div>
+      <div class="card"><h3>📋 存取紀錄</h3>
+        <p class="muted small">登入、登入失敗、改密碼、下載備份、備份失敗都會記錄。看到不認識的 IP 或大量登入失敗，請立即更換密碼。</p>
+        <div id="audit" class="small muted">${st.password_set || location.hostname === "127.0.0.1" || location.hostname === "localhost"
+          ? '<button type="button" class="small ghost" id="audit-load">顯示最近紀錄</button>' : ""}</div></div>
     </div>
     <h2 class="section">匯入 / 備份</h2>
     <div class="card" id="ly-card"><h3>⭐ 從凌越備份檔一次轉入（建議）</h3>
@@ -2324,6 +2359,22 @@ views.tools = async () => {
     } catch (err) { alert(err.message); }
   });
   saveForm("set-company");
+  saveForm("set-backup");
+  $("#backup-now").onclick = async () => {
+    $("#backup-status").innerHTML = '<p class="small muted">備份中…</p>';
+    try {
+      await api("PUT", "/api/settings", formData($("#set-backup")));
+      const r = await api("POST", "/api/backup/run");
+      const bad = Object.entries(r.status).filter(([, b]) => !b.ok);
+      toast(bad.length ? "有備份位置失敗，請看下方訊息" : "備份完成並已驗證");
+    } catch (err) { alert(err.message); }
+    refresh();
+  };
+  if ($("#audit-load")) $("#audit-load").onclick = async () => {
+    const list = await api("GET", "/api/audit");
+    $("#audit").innerHTML = table(["時間", "IP", "動作", "說明"], list.slice(0, 50).map((a) => `<tr class="${/失敗/.test(a.action) ? "low" : ""}">
+      <td class="nowrap">${esc(a.time)}</td><td>${esc(a.ip)}</td><td>${esc(a.action)}</td><td class="ellipsis">${esc(a.detail)}</td></tr>`), "還沒有紀錄");
+  };
   saveForm("set-prod", () => ({ workdays: $$(".daypick input:checked").map((c) => c.value).join("") }));
   $("#set-mach").onclick = () => machineManager();
   $("#set-pw").onsubmit = async (e) => {

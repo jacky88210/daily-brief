@@ -11,3 +11,4 @@ demo.db
 *.DBF
 lingyue_upload.001*
 files/
+data/

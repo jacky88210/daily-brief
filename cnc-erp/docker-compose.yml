@@ -1,0 +1,12 @@
+# Synology Container Manager →「專案」→ 新增 → 選這個資料夾，就會依這個檔案建立並啟動
+services:
+  cnc-erp:
+    build: .
+    container_name: cnc-erp
+    restart: unless-stopped        # NAS 重開機後自動啟動
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data               # 資料庫與圖面存在這個資料夾裡（NAS 上的實體資料夾）
+    environment:
+      - TZ=Asia/Taipei

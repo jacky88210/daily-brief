@@ -147,6 +147,9 @@ CREATE TABLE IF NOT EXISTS shipment_lines (
 );
 CREATE INDEX IF NOT EXISTS idx_ship_order ON shipments(order_id);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+-- 存取紀錄：登入成功 / 失敗、改密碼、下載備份…（機密資料要查得到誰在什麼時候做了什麼）
+CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, time TEXT NOT NULL, ip TEXT DEFAULT '',
+                                  action TEXT NOT NULL, detail TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, created TEXT NOT NULL, last_seen TEXT NOT NULL, client TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_moves_item ON stock_moves(item_id);
 CREATE INDEX IF NOT EXISTS idx_lines_order ON order_lines(order_id);
@@ -218,7 +221,7 @@ def today():
 
 PUBLIC_SETTINGS = ["company_name", "company_address", "company_phone", "company_fax", "company_tax_id",
                    "company_email", "bank_info", "hourly_rate", "workdays", "quote_terms",
-                   "tax_rate", "default_tax_type", "print_paper", "print_copies"]
+                   "tax_rate", "default_tax_type", "print_paper", "print_copies", "backup_dir", "backup_dir2", "backup_keep"]
 
 
 def get_setting(conn, key, default=""):
@@ -238,6 +241,12 @@ def get_settings(conn, q=None):
     out["tax_rate"] = out["tax_rate"] or "5"
     out["default_tax_type"] = out["default_tax_type"] or "exclusive"
     out["print_paper"] = out["print_paper"] or "A4"
+    out["backup_keep"] = out["backup_keep"] or "30"
+    try:
+        out["backup_status"] = json.loads(get_setting(conn, "backup_status") or "{}")
+    except ValueError:
+        out["backup_status"] = {}
+    out["db_path"] = os.path.abspath(DB_PATH)
     out["password_set"] = bool(get_setting(conn, "password_hash"))
     return out
 
@@ -284,6 +293,33 @@ def set_password(conn, body):
 
 
 SESSION_DAYS = 30
+LOCAL_IPS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+MAX_FAILS, LOCK_MINUTES = 5, 10
+_fails = {}  # ip → [失敗時間]，連續輸錯鎖定用
+
+
+def audit(conn, ip, action, detail=""):
+    from datetime import datetime
+    conn.execute("INSERT INTO audit (time, ip, action, detail) VALUES (?,?,?,?)",
+                 (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ip or "", action, detail))
+    conn.execute("DELETE FROM audit WHERE id <= (SELECT MAX(id) - 5000 FROM audit)")  # 只留最近 5000 筆
+
+
+def list_audit(conn, q):
+    return rows(conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 200"))
+
+
+def login_locked(ip):
+    import time
+    now = time.time()
+    recent = [t for t in _fails.get(ip, []) if now - t < LOCK_MINUTES * 60]
+    _fails[ip] = recent
+    return len(recent) >= MAX_FAILS
+
+
+def login_failed(ip):
+    import time
+    _fails.setdefault(ip, []).append(time.time())
 
 
 def new_session(conn, client=""):
@@ -1160,6 +1196,122 @@ def backup_bytes():
         os.remove(tmp)
 
 
+def verify_backup(data):
+    """確認備份 zip 能用：壓縮檔沒壞、裡面的資料庫能開、資料庫完整性檢查通過。"""
+    import zipfile
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        bad = z.testzip()
+        if bad:
+            raise OSError(f"備份檔內容損毀：{bad}")
+        db = z.read("cnc.db")
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(db)
+        c = sqlite3.connect(tmp)
+        try:
+            ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM items").fetchone()
+        finally:
+            c.close()
+        if ok != "ok":
+            raise OSError("備份裡的資料庫檢查不通過：" + ok)
+    finally:
+        os.remove(tmp)
+
+
+def backup_to_dir(force=False):
+    """自動備份到「備份位置 1、2」（例：NAS 資料夾 + 另一顆硬碟）。每天一份、寫完驗證、保留最近 N 份。
+    回傳 {資料夾: {"ok": bool, "time": ..., "path"/"error": ...}}。"""
+    from datetime import datetime
+    conn = connect()
+    try:
+        targets = [get_setting(conn, k).strip().strip('"') for k in ("backup_dir", "backup_dir2")]
+        keep = int(float(get_setting(conn, "backup_keep") or 30))
+        try:
+            status = json.loads(get_setting(conn, "backup_status") or "{}")
+        except ValueError:
+            status = {}
+    finally:
+        conn.close()
+    targets = [t for t in targets if t]
+    status = {k: v for k, v in status.items() if k in targets}
+    name = f"cnc-backup-{today()}.zip"
+    data = None
+    for target in targets:
+        path = os.path.join(target, name)
+        now = f"{datetime.now():%Y-%m-%d %H:%M}"
+        try:
+            if not os.path.isdir(target):
+                raise OSError(f"找不到資料夾（NAS 或外接硬碟是否有開、有接上？）")
+            if not force and os.path.exists(path) and status.get(target, {}).get("ok"):
+                continue
+            if data is None:
+                data = backup_bytes()
+                verify_backup(data)
+            tmp = path + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            with open(tmp, "rb") as f:  # 讀回來比對，確認真的寫進去了
+                if f.read() != data:
+                    raise OSError("寫入後讀回的內容不一致")
+            os.replace(tmp, path)
+            old = sorted(n for n in os.listdir(target) if re.fullmatch(r"cnc-backup-\d{4}-\d{2}-\d{2}\.zip", n))
+            for n in (old[:-keep] if keep > 0 else []):
+                os.remove(os.path.join(target, n))
+            status[target] = {"ok": True, "time": now, "path": path, "size": len(data)}
+        except Exception as e:  # 備份失敗不能讓系統停掉，記下來顯示在畫面上
+            status[target] = {"ok": False, "time": now, "error": str(e)}
+    conn = connect()
+    try:
+        with conn:
+            set_setting(conn, "backup_status", json.dumps(status, ensure_ascii=False))
+            for t, st in status.items():
+                if not st["ok"]:
+                    audit(conn, "system", "自動備份失敗", f"{t}：{st['error']}")
+    finally:
+        conn.close()
+    return status
+
+
+def run_backup_now(conn, body):
+    conn.commit()
+    status = backup_to_dir(force=True)
+    if not status:
+        raise ApiError("還沒有設定備份位置")
+    return {"status": status}
+
+
+def start_backup_thread():
+    """背景每 30 分鐘檢查一次，當天還沒備份就備份。"""
+    import threading
+    import time
+
+    def loop():
+        while True:
+            try:
+                backup_to_dir()
+            except Exception as e:
+                sys.stderr.write(f"auto backup error: {e!r}\n")
+            time.sleep(1800)
+    threading.Thread(target=loop, daemon=True, name="auto-backup").start()
+
+
+def on_network_share(path):
+    """資料庫放在網路磁碟（\\\\NAS\\... 或對應的磁碟機）上很容易損毀。"""
+    p = os.path.abspath(path)
+    if p.startswith("\\\\") or p.startswith("//"):
+        return True
+    if os.name == "nt" and len(p) > 1 and p[1] == ":":
+        try:
+            import ctypes
+            return ctypes.windll.kernel32.GetDriveTypeW(p[:2] + "\\") == 4  # DRIVE_REMOTE
+        except Exception:
+            return False
+    return False
+
+
 # ---------------------------------------------------------------- 凌越備份匯入
 
 def lingyue_upload_path():
@@ -1225,6 +1377,8 @@ ROUTES = [
     ("GET", r"/api/statement", lambda c, q, b: _m("documents").statement(c, q)),
     ("GET", r"/api/statement/partners", lambda c, q, b: _m("documents").statement_partners(c, q)),
     ("PUT", r"/api/settings", lambda c, q, b: save_settings(c, b)),
+    ("POST", r"/api/backup/run", lambda c, q, b: run_backup_now(c, b)),
+    ("GET", r"/api/audit", lambda c, q, b: list_audit(c, q)),
     ("POST", r"/api/settings/password", lambda c, q, b: set_password(c, b)),
     ("GET", r"/api/files", lambda c, q, b: _m("quotes").list_files(c, q.get("owner_type"), q.get("owner_id") or 0)),
     ("DELETE", r"/api/files/(\d+)", lambda c, q, b, i: _m("quotes").delete_file(c, int(i))),
@@ -1318,29 +1472,51 @@ class Handler(BaseHTTPRequestHandler):
         return bytes(data)
 
     def _auth(self, url, method):
-        """回傳 None 表示可以繼續；否則回傳要送出的 (status, payload, headers)。"""
+        """回傳 None 表示可以繼續；否則回傳要送出的 (status, payload, headers)。
+
+        規則：
+        - 設了密碼：所有 /api 都要登入（每台裝置登入一次，30 天有效）。
+        - 還沒設密碼：只有系統電腦本身（127.0.0.1）能用；其他電腦 / 手機只能先設定密碼，看不到任何資料。
+        - 同一個 IP 連續輸錯 5 次密碼，鎖 10 分鐘。"""
+        ip = self.client_address[0]
+        local = ip in LOCAL_IPS
         conn = connect()
         try:
             with conn:
                 required = bool(get_setting(conn, "password_hash"))
                 token = self._cookie("cnc_session")
                 if url.path == "/api/auth/status":
-                    ok = not required or valid_session(conn, token)
-                    return 200, {"required": required, "logged_in": ok}, {}
+                    ok = valid_session(conn, token) if required else local
+                    return 200, {"required": required, "logged_in": ok, "setup_needed": not required and not local}, {}
                 if url.path == "/api/auth/login" and method == "POST":
+                    if login_locked(ip):
+                        return 429, {"error": f"密碼錯誤太多次，請 {LOCK_MINUTES} 分鐘後再試"}, {}
                     try:
                         body = json.loads(self._read_body(10000).decode("utf-8") or "{}")
                     except ValueError:
                         body = {}
-                    if not check_password(conn, body.get("password", "")):
+                    if not required or not check_password(conn, body.get("password", "")):
+                        login_failed(ip)
+                        audit(conn, ip, "登入失敗", self.headers.get("User-Agent", "")[:120])
                         return 403, {"error": "密碼不正確"}, {}
-                    tok = new_session(conn, self.client_address[0])
+                    _fails.pop(ip, None)
+                    tok = new_session(conn, ip)
+                    audit(conn, ip, "登入", self.headers.get("User-Agent", "")[:120])
                     return 200, {"ok": True}, {"Set-Cookie": f"cnc_session={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}"}
                 if url.path == "/api/auth/logout":
                     conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                    audit(conn, ip, "登出")
                     return 200, {"ok": True}, {"Set-Cookie": "cnc_session=; Path=/; Max-Age=0"}
-                if required and not valid_session(conn, token):
-                    return 401, {"error": "請先登入", "login": True}, {}
+                if required:
+                    if not valid_session(conn, token):
+                        return 401, {"error": "請先登入", "login": True}, {}
+                elif not local and not (url.path == "/api/settings/password" and method == "POST"):
+                    return 403, {"error": "這套系統還沒有設定密碼，為了保護客戶資料，請先設定密碼才能從其他裝置使用。",
+                                 "setup": True}, {}
+                if url.path == "/api/backup":
+                    audit(conn, ip, "下載備份檔")
+                elif url.path == "/api/settings/password":
+                    audit(conn, ip, "設定 / 變更密碼")
         finally:
             conn.close()
         return None
@@ -1465,12 +1641,18 @@ def main():
         with conn:
             set_setting(conn, "password_hash", "")
             conn.execute("DELETE FROM sessions")
+            audit(conn, "本機指令", "清除密碼（--reset-password）")
         conn.close()
         print("已清除登入密碼，請重新啟動系統後到「設定」重新設定。")
         return
     if args.demo:
         from demo_data import load_demo
         load_demo()
+    if on_network_share(DB_PATH):
+        print("【警告】資料庫放在網路磁碟（NAS）上！多人同時使用時資料可能損毀。")
+        print("        請把系統放在本機硬碟執行，並在「設定」開啟「自動備份到 NAS」；")
+        print("        或依說明把整套系統裝在 NAS 上（Container Manager / Docker）。")
+    start_backup_thread()
     host = "0.0.0.0" if args.lan else "127.0.0.1"
     srv = ThreadingHTTPServer((host, args.port), Handler)
     print(f"CNC 進銷存系統已啟動：http://127.0.0.1:{args.port}  （資料庫：{DB_PATH}）")
@@ -1480,7 +1662,7 @@ def main():
         has_pw = bool(get_setting(conn, "password_hash"))
         conn.close()
         if not has_pw:
-            print("【注意】尚未設定登入密碼！同一個網路裡的人都能看到資料。請到「設定」頁設定密碼。")
+            print("【注意】尚未設定登入密碼：其他電腦 / 手機連線時會被要求先設定密碼，設定前看不到任何資料。")
     print("關閉此視窗即停止系統")
     try:
         srv.serve_forever()
