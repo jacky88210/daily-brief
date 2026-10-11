@@ -222,17 +222,20 @@ class HttpTest(Base):
             return e.code, e.read(), e.headers
 
     def test_login_flow(self):
-        self.assertEqual(self.req("GET", "/api/dashboard")[0], 200)  # 沒設密碼前不用登入
-        self.assertEqual(self.req("POST", "/api/settings/password", {"new_password": "1234"})[0], 200)
+        self.assertEqual(self.req("GET", "/api/dashboard")[0], 200)  # 還沒有帳號前，系統電腦本機可以直接用
+        self.assertEqual(self.req("POST", "/api/auth/setup", {"username": "boss", "display_name": "老闆", "password": "abc123!"})[0], 200)
+        self.cookie = ""
         self.assertEqual(self.req("GET", "/api/dashboard")[0], 401)
-        self.assertEqual(json.loads(self.req("GET", "/api/auth/status")[1]), {"required": True, "logged_in": False, "setup_needed": False})
-        self.assertEqual(self.req("POST", "/api/auth/login", {"password": "wrong"})[0], 403)
-        self.assertEqual(self.req("POST", "/api/auth/login", {"password": "1234"})[0], 200)
+        st = json.loads(self.req("GET", "/api/auth/status")[1])
+        self.assertEqual((st["required"], st["logged_in"], st["setup_needed"]), (True, False, False))
+        self.assertEqual(self.req("POST", "/api/auth/login", {"username": "boss", "password": "wrong"})[0], 403)
+        self.assertEqual(self.req("POST", "/api/auth/login", {"username": "boss", "password": "abc123!"})[0], 200)
         self.assertTrue(self.cookie.startswith("cnc_session="))
         self.assertEqual(self.req("GET", "/api/dashboard")[0], 200)
+        self.assertEqual(json.loads(self.req("GET", "/api/me")[1])["display_name"], "老闆")
         self.assertEqual(self.req("GET", "/")[0], 200)  # 頁面本身不含資料，可以直接開
-        # 換密碼要舊密碼
-        self.assertEqual(self.req("POST", "/api/settings/password", {"old_password": "x", "new_password": "5678"})[0], 403)
+        # 換密碼要輸入目前的密碼
+        self.assertEqual(self.req("POST", "/api/me/password", {"old_password": "x", "new_password": "newpass9"})[0], 403)
         self.assertEqual(self.req("POST", "/api/auth/logout")[0], 200)
         self.cookie = ""
         self.assertEqual(self.req("GET", "/api/files/1/raw")[0], 401)

@@ -15,6 +15,7 @@
 <body>
 <header class="topbar">
   <div class="brand">CNC 進銷存</div>
+  <a class="userchip" id="userchip" hidden></a>
   <nav id="nav">
     <a data-view="dashboard">總覽</a>
     <a data-view="quotes">報價</a>
@@ -46,11 +47,13 @@
 <dialog id="login">
   <form id="login-form">
     <h2>🔒 請登入</h2>
-    <p class="muted">這套系統設有密碼。登入後這台裝置 30 天內不用再輸入。</p>
-    <input type="password" id="login-pw" placeholder="密碼" autocomplete="current-password" required>
+    <p class="muted" id="login-msg">每個人用自己的帳號登入。登入後這台裝置 30 天內不用再輸入。</p>
+    <input id="login-user" placeholder="帳號" autocomplete="username" autocapitalize="none" required>
+    <input id="login-name" placeholder="你的名字（例：王大明）" hidden style="margin-top:8px">
+    <input type="password" id="login-pw" placeholder="密碼" autocomplete="current-password" required style="margin-top:8px">
     <input type="password" id="login-pw2" placeholder="再輸入一次密碼" autocomplete="new-password" hidden style="margin-top:8px">
     <p class="error" id="login-error"></p>
-    <div class="actions"><button type="submit">登入</button></div>
+    <div class="actions"><button type="submit" id="login-btn">登入</button></div>
   </form>
 </dialog>
 <nav class="mobilebar">

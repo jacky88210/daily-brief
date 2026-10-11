@@ -135,7 +135,7 @@ class AccessTest(Base):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}"), ""
 
-    def test_remote_blocked_until_password_set(self):
+    def test_remote_blocked_until_account_created(self):
         ip = lan_ip()
         if not ip:
             self.skipTest("沒有區網位址可以模擬")
@@ -143,38 +143,38 @@ class AccessTest(Base):
         status, body, _ = self.req(remote, "GET", "/api/items")
         self.assertEqual((status, body.get("setup")), (403, True))
         self.assertTrue(self.req(remote, "GET", "/api/auth/status")[1]["setup_needed"])
-        # 第一次設定密碼可以從遠端做（例如裝在 NAS 上時）
-        self.assertEqual(self.req(remote, "POST", "/api/settings/password", {"new_password": "s3cret"})[0], 200)
-        self.assertEqual(self.req(remote, "GET", "/api/items")[0], 401)
-        status, _, cookie = self.req(remote, "POST", "/api/auth/login", {"password": "s3cret"})
+        # 第一次可以從遠端建立管理員（例如系統裝在 NAS 上時）
+        status, _, cookie = self.req(remote, "POST", "/api/auth/setup", {"username": "boss", "password": "s3cret!!"})
+        self.assertEqual(status, 200)
         self.assertEqual(self.req(remote, "GET", "/api/items", cookie=cookie.split(";")[0])[0], 200)
-        # 已經有密碼後，遠端不能不知道舊密碼就改掉
-        self.assertEqual(self.req(remote, "POST", "/api/settings/password", {"new_password": "hijack"},
-                                  cookie=cookie.split(";")[0])[0], 403)
+        self.assertEqual(self.req(remote, "GET", "/api/items")[0], 401)
+        # 已經有帳號後，別人不能再用 setup 建立管理員
+        self.assertEqual(self.req(remote, "POST", "/api/auth/setup", {"username": "evil", "password": "hijack123"})[0], 403)
 
-    def test_local_works_without_password(self):
+    def test_local_works_without_accounts(self):
         local = self.start("127.0.0.1")
         self.assertEqual(self.req(local, "GET", "/api/items")[0], 200)
 
     def test_lockout_after_five_failures_and_audit(self):
         local = self.start("127.0.0.1")
-        self.req(local, "POST", "/api/settings/password", {"new_password": "right"})
+        _, _, admin_cookie = self.req(local, "POST", "/api/auth/setup", {"username": "boss", "password": "right-pw"})
         for _ in range(5):
-            self.assertEqual(self.req(local, "POST", "/api/auth/login", {"password": "wrong"})[0], 403)
-        status, body, _ = self.req(local, "POST", "/api/auth/login", {"password": "right"})
+            self.assertEqual(self.req(local, "POST", "/api/auth/login", {"username": "boss", "password": "wrong"})[0], 403)
+        status, body, _ = self.req(local, "POST", "/api/auth/login", {"username": "boss", "password": "right-pw"})
         self.assertEqual(status, 429)  # 鎖住了，連正確密碼也要等
         self.assertIn("分鐘", body["error"])
         server._fails.clear()
-        status, _, cookie = self.req(local, "POST", "/api/auth/login", {"password": "right"})
+        status, _, cookie = self.req(local, "POST", "/api/auth/login", {"username": "boss", "password": "right-pw"})
         self.assertEqual(status, 200)
         c = cookie.split(";")[0]
-        actions = [r["action"] for r in self.req(local, "GET", "/api/audit", cookie=c)[1]]
+        log = self.req(local, "GET", "/api/audit", cookie=c)[1]
+        actions = [r["action"] for r in log]
         self.assertEqual(actions.count("登入失敗"), 5)
         self.assertIn("登入", actions)
-        self.assertIn("設定 / 變更密碼", actions)
+        self.assertIn("建立第一個管理員帳號", actions)
         urllib.request.urlopen(urllib.request.Request(local + "/api/backup", headers={"Cookie": c})).read()
-        self.assertEqual(self.req(local, "GET", "/api/audit", cookie=c)[1][0]["action"], "下載備份檔")
-
+        top = self.req(local, "GET", "/api/audit", cookie=c)[1][0]
+        self.assertEqual((top["action"], top["username"]), ("下載備份檔", "boss"))
 
 if __name__ == "__main__":
     unittest.main()

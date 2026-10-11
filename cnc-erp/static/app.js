@@ -39,37 +39,89 @@ function showLogin(setup) {
   return new Promise((resolve) => {
     loginWaiters.push(resolve);
     const dlg = $("#login");
-    $("#login h2").textContent = setup ? "🔒 第一次使用：請設定密碼" : "🔒 請登入";
-    $("#login p.muted").textContent = setup
-      ? "為了保護客戶資料，從其他電腦或手機使用前，必須先設定一組密碼（至少 4 個字，建議 8 個字以上）。之後每台裝置都要輸入這組密碼。"
-      : "這套系統設有密碼。登入後這台裝置 30 天內不用再輸入。";
-    $("#login-pw2").hidden = !setup;
-    $("#login-pw2").required = !!setup;
+    $("#login h2").textContent = setup ? "🔒 第一次使用：建立管理員帳號" : "🔒 請登入";
+    $("#login-msg").textContent = setup
+      ? "為了保護客戶資料，請先建立管理員（通常是老闆）的帳號。之後由管理員在「設定 → 使用者帳號」幫其他人開帳號。密碼至少 6 個字。"
+      : "每個人用自己的帳號登入。登入後這台裝置 30 天內不用再輸入。";
+    $("#login-btn").textContent = setup ? "建立並登入" : "登入";
+    ["#login-name", "#login-pw2"].forEach((id) => { $(id).hidden = !setup; $(id).required = !!setup; });
+    $("#login-pw").autocomplete = setup ? "new-password" : "current-password";
     $("#login-error").textContent = "";
     $("#login-pw").value = "";
     $("#login-pw2").value = "";
-    dlg.showModal();
-    setTimeout(() => $("#login-pw").focus(), 50);
+    if (!dlg.open) dlg.showModal();
+    setTimeout(() => ($("#login-user").value ? $("#login-pw") : $("#login-user")).focus(), 50);
     $("#login-form").onsubmit = async (e) => {
       e.preventDefault();
-      const pw = $("#login-pw").value;
+      const username = $("#login-user").value.trim(), pw = $("#login-pw").value;
+      let res;
       if (setup) {
         if (pw !== $("#login-pw2").value) return ($("#login-error").textContent = "兩次輸入的密碼不一樣");
-        const r = await fetch("/api/settings/password", { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ new_password: pw }) });
-        if (!r.ok) return ($("#login-error").textContent = (await r.json().catch(() => ({}))).error || "設定失敗");
+        res = await fetch("/api/auth/setup", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, display_name: $("#login-name").value.trim(), password: pw }) });
+      } else {
+        res = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password: pw }) });
       }
-      const res = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: pw }) });
       if (!res.ok) {
-        $("#login-error").textContent = (await res.json().catch(() => ({}))).error || "密碼不正確";
+        $("#login-error").textContent = (await res.json().catch(() => ({}))).error || "帳號或密碼不正確";
         return;
       }
+      try { localStorage.setItem("last-user", username); } catch (err) {}
       dlg.close();
+      await loadMe();
       const ws = loginWaiters;
       loginWaiters = null;
       ws.forEach((r) => r());
     };
+  });
+}
+
+// ---- 目前登入的人：依角色顯示選單（現場人員只看到排程與報工）
+let me = null;
+const ROLE_VIEWS = { floor: ["floor", "schedule"] };
+async function loadMe() {
+  const st = await fetch("/api/auth/status").then((r) => r.json()).catch(() => ({}));
+  me = st.user || (st.local && !st.required ? { display_name: "系統電腦", role: "admin", local: true } : null);
+  try { if (!$("#login-user").value) $("#login-user").value = localStorage.getItem("last-user") || ""; } catch (e) {}
+  const chip = $("#userchip");
+  chip.hidden = !me;
+  if (me) chip.textContent = `👤 ${me.display_name}${me.local ? "" : `（${me.role_label}）`}`;
+  const only = me && ROLE_VIEWS[me.role];
+  $$("#nav a, .mobilebar a").forEach((a) => (a.hidden = !!only && !only.includes(a.dataset.view)));
+  return st;
+}
+const canSee = (view) => !me || !ROLE_VIEWS[me.role] || ROLE_VIEWS[me.role].includes(view);
+
+function accountModal() {
+  if (me && me.local) {
+    return modal({ title: "系統電腦（本機）", hideOk: true, body: `<p>目前還沒有建立帳號，在系統電腦上可以直接使用。</p>
+      <p>要讓其他人（或手機）使用，請管理員到「設定 → 使用者帳號」建立帳號。</p>` });
+  }
+  modal({
+    title: `${me.display_name}（${me.role_label}）`, ok: "變更密碼",
+    body: `<p class="muted">帳號：${esc(me.username)}${me.last_login ? `　上次登入：${esc(me.last_login)}` : ""}</p>
+      <div class="fields">
+        ${field("目前的密碼", "old_password", "", 'type="password" autocomplete="current-password"')}
+        ${field("新密碼（至少 6 個字）", "new_password", "", 'type="password" autocomplete="new-password"')}
+      </div>
+      <div class="actions" style="justify-content:flex-start"><button type="button" class="ghost" id="logout">登出這台裝置</button></div>`,
+    onOpen: () => {
+      $("#logout").onclick = async () => {
+        await fetch("/api/auth/logout", { method: "POST" });
+        $("#modal").close();
+        me = null;
+        $("#userchip").hidden = true;
+        await showLogin();
+        refresh();
+      };
+    },
+    onSubmit: async (form) => {
+      const d = formData(form);
+      if (!d.old_password || !d.new_password) throw new Error("請輸入目前的密碼和新密碼");
+      await api("POST", "/api/me/password", d);
+      toast("密碼已變更");
+    },
   });
 }
 
@@ -213,7 +265,8 @@ function go(view) {
   location.hash = view;
 }
 async function render() {
-  const [view, arg] = decodeURIComponent(location.hash.slice(1) || "dashboard").split(":");
+  let [view, arg] = decodeURIComponent(location.hash.slice(1) || (me && me.role === "floor" ? "floor" : "dashboard")).split(":");
+  if (!canSee(view === "partner" ? "partners" : view === "quote" ? "quotes" : view)) view = "floor";
   const navView = { partner: "partners", quote: "quotes", moves: "items" }[view] || view;
   if (view === "partners" && arg) partnersState().type = arg;
   $$("#nav a, .mobilebar a").forEach((a) => a.classList.toggle("active", a.dataset.view === navView));
@@ -2125,6 +2178,44 @@ views.docs = async () => {
   }
 };
 
+// ---------------------------------------------------------------- 使用者帳號（管理員）
+
+const ROLE_OPTS = [["admin", "管理員"], ["office", "辦公室人員"], ["floor", "現場人員"]];
+
+async function loadUsers() {
+  const users = await api("GET", "/api/users");
+  $("#users").innerHTML = table(["名字", "帳號", "角色", "上次登入", "狀態", ""], users.map((u) => `<tr class="${u.active ? "" : "muted"}">
+    <td>${esc(u.display_name)}</td><td>${esc(u.username)}</td><td>${esc(u.role_label)}</td><td>${esc(u.last_login || "從未")}</td>
+    <td>${u.active ? '<span class="tag ok">啟用</span>' : '<span class="tag">停用</span>'}</td>
+    <td><button type="button" class="small ghost" data-user="${u.id}">修改</button></td></tr>`));
+  $$("[data-user]").forEach((b) => (b.onclick = () => userForm(users.find((u) => String(u.id) === b.dataset.user))));
+}
+
+function userForm(u) {
+  modal({
+    title: u ? `修改帳號：${u.display_name}` : "新增帳號",
+    body: `<div class="fields">
+      ${field("名字（顯示在紀錄上）*", "display_name", u ? u.display_name : "", 'required placeholder="例：王經理"')}
+      ${field("登入帳號 *（英文、數字）", "username", u ? u.username : "", 'required autocapitalize="none" placeholder="例：wang"')}
+      ${selectField("角色", "role", ROLE_OPTS, u ? u.role : "office")}
+      ${field(u ? "重設密碼（不改就留空）" : "初始密碼 *（至少 6 個字）", "password", "", `type="text" autocomplete="off" ${u ? "" : "required"}`)}
+      ${u ? `<label class="wide"><span><input type="checkbox" name="active" value="1" style="width:auto" ${u.active ? "checked" : ""}> 啟用（取消勾選 = 停用，立即登出、不能再登入）</span></label>` : ""}
+    </div><p class="muted small">請當面或用私訊把帳號和初始密碼給對方，並請他登入後在右上角的名字 →「變更密碼」改成自己的密碼。</p>`,
+    onSubmit: async (form) => {
+      const d = formData(form);
+      if (u) {
+        d.active = d.active ? 1 : 0;
+        if (!d.password) delete d.password;
+        await api("PUT", "/api/users/" + u.id, d);
+      } else {
+        await api("POST", "/api/users", d);
+      }
+      toast("已儲存");
+      loadUsers();
+    },
+  });
+}
+
 // ---------------------------------------------------------------- 凌越備份轉入
 
 const LY_KINDS = [["sales", "銷貨"], ["sales_return", "銷貨退回"], ["purchase", "進貨"],
@@ -2245,6 +2336,15 @@ function wireLingyue() {
 }
 
 views.tools = async () => {
+  if (me && me.role !== "admin") {
+    app.innerHTML = `<h1>設定</h1>
+      <div class="card"><h3>👤 我的帳號</h3><p>${esc(me.display_name)}（${esc(me.role_label)}）　帳號 ${esc(me.username)}</p>
+        <button id="my-acc">變更密碼 / 登出</button></div>
+      <div class="card"><h3>📊 匯出庫存表（Excel 可開）</h3><a class="btn" href="/api/export/stock.csv">下載庫存 CSV</a></div>
+      <p class="muted">系統設定、使用者帳號、備份與匯入只有管理員可以操作。</p>`;
+    $("#my-acc").onclick = () => accountModal();
+    return;
+  }
   const st = await api("GET", "/api/settings");
   const days = "一二三四五六日";
   app.innerHTML = `
@@ -2273,19 +2373,17 @@ views.tools = async () => {
           ${field("一式多聯（逗號分隔，空白 = 一張）", "print_copies", st.print_copies, 'placeholder="例：第一聯 客戶聯,第二聯 存根聯"')}
           <div class="wide"><button type="submit">儲存</button> <button type="button" class="ghost" id="set-mach">⚙️ 機台設定</button></div>
         </form></div>
-      <div class="card"><h3>🔒 登入密碼 ${st.password_set ? '<span class="tag ok">已設定</span>' : '<span class="tag danger">未設定</span>'}</h3>
-        <p class="muted">${st.password_set ? "其他電腦 / 手機連線時要輸入密碼（每台裝置 30 天內免重登）。"
-          : "目前任何連得到這台電腦的人都能看到資料。<b>要在外面用手機連線，一定要先設密碼。</b>"}</p>
-        <form id="set-pw" class="fields">
-          ${st.password_set ? field("目前密碼", "old_password", "", 'type="password" autocomplete="current-password"') : ""}
-          ${field(st.password_set ? "新密碼（留空 = 取消密碼）" : "設定密碼（至少 4 個字）", "new_password", "", 'type="password" autocomplete="new-password"')}
-          <div class="wide"><button type="submit">${st.password_set ? "變更密碼" : "設定密碼"}</button></div>
-        </form>
-        <p class="muted small">忘記密碼：在系統電腦上執行 <code>python server.py --reset-password</code>。</p></div>
+      <div class="card"><h3>👥 使用者帳號 ${st.has_users ? "" : '<span class="tag danger">還沒有帳號</span>'}</h3>
+        <p class="muted">每個人一個帳號，不要共用。存取紀錄會記下是誰新增訂單、改報價、出貨…；有人離職只要停用他的帳號。</p>
+        <div id="users">${st.has_users ? '<p class="muted">載入中…</p>' : ""}</div>
+        <button type="button" id="user-add">${st.has_users ? "＋ 新增帳號" : "建立第一個管理員帳號"}</button>
+        <p class="muted small">角色：<b>管理員</b>＝全部功能（含帳號、設定、備份）；<b>辦公室人員</b>＝報價、訂單、採購、庫存、客戶、排程、單據；
+          <b>現場人員</b>＝只有現場報工、排程與看圖面，看不到價格與客戶往來。</p>
+        <p class="muted small">管理員忘記密碼：在系統電腦執行 <code>python server.py --reset-admin</code> 取得臨時密碼。</p></div>
       <div class="card"><h3>📱 在外面用手機</h3>
         <p>建議用免費的 <b>Tailscale</b> 建立私人連線（不用設定路由器、不會把系統公開到網路上）：</p>
         <ol class="small">
-          <li>先在左邊<b>設定登入密碼</b>。</li>
+          <li>先在「使用者帳號」<b>幫每個人建立帳號</b>。</li>
           <li>在跑系統的電腦和你的手機都安裝 Tailscale（tailscale.com，Windows / iPhone / Android 都有），用同一個帳號登入。</li>
           <li>用 <code>start.bat</code> 啟動系統（已開放連線）。</li>
           <li>手機打開 Tailscale App，找到那台電腦的位址（100.x.x.x），用瀏覽器開 <code>http://100.x.x.x:8080</code>。</li>
@@ -2307,8 +2405,7 @@ views.tools = async () => {
           || '<p class="small down">⚠️ 還沒設定自動備份。商業資料請至少設定兩個備份位置。</p>'}</div></div>
       <div class="card"><h3>📋 存取紀錄</h3>
         <p class="muted small">登入、登入失敗、改密碼、下載備份、備份失敗都會記錄。看到不認識的 IP 或大量登入失敗，請立即更換密碼。</p>
-        <div id="audit" class="small muted">${st.password_set || location.hostname === "127.0.0.1" || location.hostname === "localhost"
-          ? '<button type="button" class="small ghost" id="audit-load">顯示最近紀錄</button>' : ""}</div></div>
+        <div id="audit" class="small"><button type="button" class="small ghost" id="audit-load">顯示最近紀錄</button></div></div>
     </div>
     <h2 class="section">匯入 / 備份</h2>
     <div class="card" id="ly-card"><h3>⭐ 從凌越備份檔一次轉入（建議）</h3>
@@ -2375,20 +2472,14 @@ views.tools = async () => {
   };
   if ($("#audit-load")) $("#audit-load").onclick = async () => {
     const list = await api("GET", "/api/audit");
-    $("#audit").innerHTML = table(["時間", "IP", "動作", "說明"], list.slice(0, 50).map((a) => `<tr class="${/失敗/.test(a.action) ? "low" : ""}">
-      <td class="nowrap">${esc(a.time)}</td><td>${esc(a.ip)}</td><td>${esc(a.action)}</td><td class="ellipsis">${esc(a.detail)}</td></tr>`), "還沒有紀錄");
+    $("#audit").innerHTML = table(["時間", "使用者", "IP", "動作", "說明"], list.slice(0, 100).map((a) => `<tr class="${/失敗/.test(a.action) ? "low" : ""}">
+      <td class="nowrap">${esc(a.time)}</td><td>${esc(a.username || "")}</td><td>${esc(a.ip)}</td><td>${esc(a.action)}</td>
+      <td class="ellipsis">${esc(a.detail)}</td></tr>`), "還沒有紀錄");
   };
   saveForm("set-prod", () => ({ workdays: $$(".daypick input:checked").map((c) => c.value).join("") }));
   $("#set-mach").onclick = () => machineManager();
-  $("#set-pw").onsubmit = async (e) => {
-    e.preventDefault();
-    try {
-      const r = await api("POST", "/api/settings/password", formData(e.target));
-      toast(r.password_set ? "已設定密碼" : "已取消密碼");
-      if (r.password_set) await showLogin();
-      refresh();
-    } catch (err) { alert(err.message); }
-  };
+  if (st.has_users) loadUsers();
+  $("#user-add").onclick = () => (st.has_users ? userForm() : showLogin(true).then(refresh));
   $("#ly-path").placeholder = "例：\\\\YHH\\homes\\HSU_HOME\\公司\\wstkBKUP.001";
   wireLingyue();
   const imp = { file: null, data: null, mapping: null, header_row: null };
@@ -2465,4 +2556,9 @@ views.tools = async () => {
   $("#imp-target").onchange = () => { syncCat(); imp.mapping = null; imp.header_row = null; preview(); };
 };
 
-render();
+$("#userchip").onclick = () => accountModal();
+loadMe().then(async (st) => {
+  if (st.setup_needed) await showLogin(true);
+  else if (st.required && !st.logged_in) await showLogin();
+  render();
+});

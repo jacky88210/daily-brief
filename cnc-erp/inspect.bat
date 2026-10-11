@@ -6,6 +6,16 @@ if "%~1"=="" (
   pause
   exit /b
 )
-python tools\inspect_backup.py %* > 檢查結果.txt 2>&1
-if errorlevel 9009 py tools\inspect_backup.py %* > 檢查結果.txt 2>&1
+set PY=
+python -c "import sys" >nul 2>nul && set PY=python
+if not defined PY py -3 -c "import sys" >nul 2>nul && set PY=py -3
+if not defined PY (
+  echo.
+  echo 這台電腦還沒有安裝 Python。
+  echo 請先雙擊同一個資料夾裡的「install-python.bat」安裝，裝好後再執行一次。
+  echo.
+  pause
+  exit /b 1
+)
+%PY% tools\inspect_backup.py %* > 檢查結果.txt 2>&1
 notepad 檢查結果.txt

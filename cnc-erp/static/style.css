@@ -285,3 +285,6 @@ td.nowrap, table button { white-space: nowrap; }
   #q-form .actions { position: sticky; bottom: 70px; background: var(--card); padding: 8px 0; margin: 0; z-index: 5; }
   #q-form .actions button { width: 100%; padding: 12px; font-size: 17px; }
 }
+.userchip { order: 3; margin-left: auto; color: var(--brand-ink); white-space: nowrap; cursor: pointer; font-size: 14px; opacity: .9; padding: 4px 8px; border-radius: 6px; }
+.userchip:hover { background: rgba(255, 255, 255, .15); }
+#login input + input { margin-top: 8px; }

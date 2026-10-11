@@ -174,6 +174,8 @@ MIGRATIONS = {
                  ("reg_checked", "TEXT DEFAULT ''")],
     # 營業稅：exclusive = 外加、inclusive = 內含、none = 免稅（舊資料維持不含稅，金額不會變）
     "orders": [("tax_type", "TEXT DEFAULT 'none'"), ("tax_rate", "REAL DEFAULT 5")],
+    "sessions": [("user_id", "INTEGER")],
+    "audit": [("username", "TEXT DEFAULT ''")],
 }
 TAX_TYPES = {"exclusive": "外加", "inclusive": "內含", "none": "免稅"}
 # 含稅總額 = 小計 × 這個係數（內含與免稅的單價本身就是總額）
@@ -197,9 +199,11 @@ def connect(path=None):
 def init_db(path=None):
     conn = connect(path)
     try:
+        import accounts
         import production
         import quotes
         conn.executescript(SCHEMA)
+        conn.executescript(accounts.SCHEMA)
         conn.executescript(quotes.SCHEMA)
         conn.executescript(production.SCHEMA)
         for table, cols in MIGRATIONS.items():
@@ -208,6 +212,7 @@ def init_db(path=None):
                 if col not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         production.ensure_ops(conn)
+        accounts.migrate_single_password(conn)
         conn.commit()
     finally:
         conn.close()
@@ -247,7 +252,8 @@ def get_settings(conn, q=None):
     except ValueError:
         out["backup_status"] = {}
     out["db_path"] = os.path.abspath(DB_PATH)
-    out["password_set"] = bool(get_setting(conn, "password_hash"))
+    import accounts
+    out["has_users"] = accounts.has_users(conn)
     return out
 
 
@@ -268,40 +274,25 @@ def _hash_password(password, salt=None):
     return f"pbkdf2${salt}${digest}"
 
 
-def check_password(conn, password):
-    import hmac
-    stored = get_setting(conn, "password_hash")
-    if not stored:
-        return True
-    try:
-        _, salt, _ = stored.split("$")
-    except ValueError:
-        return False
-    return hmac.compare_digest(_hash_password(password or "", salt), stored)
-
-
-def set_password(conn, body):
-    """設定或變更登入密碼。已經有密碼時要輸入舊密碼。新密碼留空 = 取消密碼。"""
-    if get_setting(conn, "password_hash") and not check_password(conn, body.get("old_password", "")):
-        raise ApiError("舊密碼不正確", 403)
-    new = body.get("new_password") or ""
-    if new and len(new) < 4:
-        raise ApiError("密碼至少 4 個字")
-    set_setting(conn, "password_hash", _hash_password(new) if new else "")
-    conn.execute("DELETE FROM sessions")
-    return {"ok": True, "password_set": bool(new)}
-
-
 SESSION_DAYS = 30
 LOCAL_IPS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 MAX_FAILS, LOCK_MINUTES = 5, 10
 _fails = {}  # ip → [失敗時間]，連續輸錯鎖定用
+import threading as _threading
+CURRENT = _threading.local()  # 目前這個請求是哪個使用者（每個請求一個執行緒）
 
 
-def audit(conn, ip, action, detail=""):
+def current_user():
+    return getattr(CURRENT, "user", None)
+
+
+def audit(conn, ip, action, detail="", username=None):
     from datetime import datetime
-    conn.execute("INSERT INTO audit (time, ip, action, detail) VALUES (?,?,?,?)",
-                 (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ip or "", action, detail))
+    if username is None:
+        u = current_user()
+        username = u["display_name"] if u else ""
+    conn.execute("INSERT INTO audit (time, ip, action, detail, username) VALUES (?,?,?,?,?)",
+                 (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ip or "", action, detail, username))
     conn.execute("DELETE FROM audit WHERE id <= (SELECT MAX(id) - 5000 FROM audit)")  # 只留最近 5000 筆
 
 
@@ -322,27 +313,14 @@ def login_failed(ip):
     _fails.setdefault(ip, []).append(time.time())
 
 
-def new_session(conn, client=""):
+def new_session(conn, client="", user_id=None):
     import secrets
     from datetime import datetime
     token = secrets.token_urlsafe(32)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    conn.execute("INSERT INTO sessions (token, created, last_seen, client) VALUES (?,?,?,?)", (token, now, now, client))
+    conn.execute("INSERT INTO sessions (token, created, last_seen, client, user_id) VALUES (?,?,?,?,?)",
+                 (token, now, now, client, user_id))
     return token
-
-
-def valid_session(conn, token):
-    from datetime import datetime
-    if not token:
-        return False
-    r = conn.execute("SELECT last_seen FROM sessions WHERE token = ?", (token,)).fetchone()
-    if not r:
-        return False
-    if r[0] < _plus_days(today(), -SESSION_DAYS):
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-        return False
-    conn.execute("UPDATE sessions SET last_seen = ? WHERE token = ?", (datetime.now().strftime("%Y-%m-%d %H:%M"), token))
-    return True
 
 
 def rows(cur):
@@ -1408,7 +1386,11 @@ ROUTES = [
     ("PUT", r"/api/settings", lambda c, q, b: save_settings(c, b)),
     ("POST", r"/api/backup/run", lambda c, q, b: run_backup_now(c, b)),
     ("GET", r"/api/audit", lambda c, q, b: list_audit(c, q)),
-    ("POST", r"/api/settings/password", lambda c, q, b: set_password(c, b)),
+    ("GET", r"/api/users", lambda c, q, b: _m("accounts").list_users(c, q)),
+    ("POST", r"/api/users", lambda c, q, b: _m("accounts").create_user(c, b)),
+    ("PUT", r"/api/users/(\d+)", lambda c, q, b, i: _m("accounts").update_user(c, int(i), b)),
+    ("GET", r"/api/me", lambda c, q, b: _m("accounts").public(current_user()) or {"local": True}),
+    ("POST", r"/api/me/password", lambda c, q, b: _m("accounts").change_own_password(c, current_user(), b)),
     ("GET", r"/api/files", lambda c, q, b: _m("quotes").list_files(c, q.get("owner_type"), q.get("owner_id") or 0)),
     ("DELETE", r"/api/files/(\d+)", lambda c, q, b, i: _m("quotes").delete_file(c, int(i))),
     ("GET", r"/api/quotes", lambda c, q, b: _m("quotes").list_quotes(c, q)),
@@ -1500,55 +1482,90 @@ class Handler(BaseHTTPRequestHandler):
             data += chunk
         return bytes(data)
 
+    def _json_body(self):
+        try:
+            return json.loads(self._read_body(10000).decode("utf-8") or "{}")
+        except ValueError:
+            return {}
+
     def _auth(self, url, method):
         """回傳 None 表示可以繼續；否則回傳要送出的 (status, payload, headers)。
 
         規則：
-        - 設了密碼：所有 /api 都要登入（每台裝置登入一次，30 天有效）。
-        - 還沒設密碼：只有系統電腦本身（127.0.0.1）能用；其他電腦 / 手機只能先設定密碼，看不到任何資料。
+        - 有帳號之後：所有 /api 都要登入（每台裝置登入一次，30 天有效），並依角色限制功能。
+        - 還沒有任何帳號：只有系統電腦本身（127.0.0.1）能用；其他電腦 / 手機只能先建立管理員帳號，看不到任何資料。
         - 同一個 IP 連續輸錯 5 次密碼，鎖 10 分鐘。"""
+        import accounts
         ip = self.client_address[0]
         local = ip in LOCAL_IPS
+        CURRENT.user = None
+        cookie = lambda tok: f"cnc_session={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}"
         conn = connect()
         try:
             with conn:
-                required = bool(get_setting(conn, "password_hash"))
+                required = accounts.has_users(conn)
                 token = self._cookie("cnc_session")
+                user = accounts.session_user(conn, token) if required else None
+                CURRENT.user = user
                 if url.path == "/api/auth/status":
-                    ok = valid_session(conn, token) if required else local
-                    return 200, {"required": required, "logged_in": ok, "setup_needed": not required and not local}, {}
+                    return 200, {"required": required, "logged_in": bool(user) if required else local,
+                                 "setup_needed": not required and not local, "local": local,
+                                 "user": accounts.public(user)}, {}
+                if url.path == "/api/auth/setup" and method == "POST":
+                    if login_locked(ip):
+                        return 429, {"error": f"嘗試太多次，請 {LOCK_MINUTES} 分鐘後再試"}, {}
+                    try:
+                        r = accounts.setup_first_admin(conn, self._json_body())
+                    except ApiError as e:
+                        login_failed(ip)
+                        return e.status, {"error": str(e)}, {}
+                    audit(conn, ip, "建立第一個管理員帳號", "", "")
+                    return 200, {"ok": True}, {"Set-Cookie": cookie(new_session(conn, ip, r["id"]))}
                 if url.path == "/api/auth/login" and method == "POST":
                     if login_locked(ip):
                         return 429, {"error": f"密碼錯誤太多次，請 {LOCK_MINUTES} 分鐘後再試"}, {}
-                    try:
-                        body = json.loads(self._read_body(10000).decode("utf-8") or "{}")
-                    except ValueError:
-                        body = {}
-                    if not required or not check_password(conn, body.get("password", "")):
+                    body = self._json_body()
+                    u = accounts.authenticate(conn, body.get("username"), body.get("password")) if required else None
+                    if not u:
                         login_failed(ip)
-                        audit(conn, ip, "登入失敗", self.headers.get("User-Agent", "")[:120])
-                        return 403, {"error": "密碼不正確"}, {}
+                        audit(conn, ip, "登入失敗", f"帳號：{(body.get('username') or '')[:30]}", "")
+                        return 403, {"error": "帳號或密碼不正確"}, {}
                     _fails.pop(ip, None)
-                    tok = new_session(conn, ip)
-                    audit(conn, ip, "登入", self.headers.get("User-Agent", "")[:120])
-                    return 200, {"ok": True}, {"Set-Cookie": f"cnc_session={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}"}
+                    audit(conn, ip, "登入", self.headers.get("User-Agent", "")[:120], u["display_name"])
+                    return 200, {"ok": True, "user": accounts.public(u)}, {"Set-Cookie": cookie(new_session(conn, ip, u["id"]))}
                 if url.path == "/api/auth/logout":
                     conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-                    audit(conn, ip, "登出")
+                    if user:
+                        audit(conn, ip, "登出")
                     return 200, {"ok": True}, {"Set-Cookie": "cnc_session=; Path=/; Max-Age=0"}
                 if required:
-                    if not valid_session(conn, token):
+                    if not user:
                         return 401, {"error": "請先登入", "login": True}, {}
-                elif not local and not (url.path == "/api/settings/password" and method == "POST"):
-                    return 403, {"error": "這套系統還沒有設定密碼，為了保護客戶資料，請先設定密碼才能從其他裝置使用。",
+                    if not accounts.allowed(user["role"], method, url.path):
+                        return 403, {"error": f"您的帳號（{accounts.ROLES.get(user['role'])}）沒有使用這個功能的權限"}, {}
+                elif not local:
+                    return 403, {"error": "這套系統還沒有建立帳號，為了保護客戶資料，請先建立管理員帳號才能從其他裝置使用。",
                                  "setup": True}, {}
                 if url.path == "/api/backup":
                     audit(conn, ip, "下載備份檔")
-                elif url.path == "/api/settings/password":
-                    audit(conn, ip, "設定 / 變更密碼")
         finally:
             conn.close()
         return None
+
+    def _audit_write(self, method, path, status):
+        """修改資料的動作（新增訂單、出貨、改報價…）記到存取紀錄，查得到是誰做的。"""
+        import accounts
+        if method == "GET" or status != 200:
+            return
+        label = accounts.write_label(method, path)
+        if not label:
+            return
+        conn = connect()
+        try:
+            with conn:
+                audit(conn, self.client_address[0], label, path)
+        finally:
+            conn.close()
 
     def _dispatch(self, method):
         url = urlparse(self.path)
@@ -1569,6 +1586,7 @@ class Handler(BaseHTTPRequestHandler):
                                              query.get("name") or "file", data, query.get("note", ""))
                 finally:
                     conn.close()
+                self._audit_write(method, url.path, 200)
                 return self._send(200, r)
             except ApiError as e:
                 return self._send(e.status, {"error": str(e)})
@@ -1634,6 +1652,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # 不讓單一錯誤把伺服器弄掛
                 self.log_error("internal error: %r", e)
                 status, payload = 500, {"error": "系統錯誤：" + str(e)}
+            self._audit_write(method, url.path, status)
             return self._send(status, payload)
         if method != "GET":
             return self._send(405, {"error": "method not allowed"})
@@ -1662,17 +1681,20 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--lan", action="store_true", help="開放區網內其他電腦連線")
     ap.add_argument("--demo", action="store_true", help="資料庫是空的時候，放入示範資料")
-    ap.add_argument("--reset-password", action="store_true", help="忘記密碼時用：清除登入密碼")
+    ap.add_argument("--reset-admin", "--reset-password", action="store_true", dest="reset_admin",
+                    help="忘記管理員密碼時用：產生一組臨時密碼")
     args = ap.parse_args()
     init_db()
-    if args.reset_password:
+    if args.reset_admin:
+        import accounts
         conn = connect()
         with conn:
-            set_setting(conn, "password_hash", "")
-            conn.execute("DELETE FROM sessions")
-            audit(conn, "本機指令", "清除密碼（--reset-password）")
+            username, temp = accounts.reset_admin(conn)
+            audit(conn, "本機指令", "重設管理員密碼（--reset-admin）", username, "")
         conn.close()
-        print("已清除登入密碼，請重新啟動系統後到「設定」重新設定。")
+        print(f"管理員帳號：{username}")
+        print(f"臨時密碼：{temp}")
+        print("請用這組密碼登入後，馬上到「設定 → 我的帳號」改成自己的密碼。")
         return
     if args.demo:
         from demo_data import load_demo
@@ -1691,11 +1713,12 @@ def main():
     print(f"CNC 進銷存系統已啟動：http://127.0.0.1:{args.port}  （資料庫：{DB_PATH}）")
     if args.lan:
         print("已開放區網連線，其他電腦請用這台電腦的 IP 位址加上 :%d 連線" % args.port)
+        import accounts
         conn = connect()
-        has_pw = bool(get_setting(conn, "password_hash"))
+        has = accounts.has_users(conn)
         conn.close()
-        if not has_pw:
-            print("【注意】尚未設定登入密碼：其他電腦 / 手機連線時會被要求先設定密碼，設定前看不到任何資料。")
+        if not has:
+            print("【注意】還沒有建立帳號：其他電腦 / 手機連線時會被要求先建立管理員帳號，建立前看不到任何資料。")
     start_backup_thread()
     print("關閉此視窗即停止系統")
     try:
