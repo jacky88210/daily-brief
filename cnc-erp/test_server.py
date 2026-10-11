@@ -107,7 +107,7 @@ class ErpTest(unittest.TestCase):
         server.deliver_order(self.conn, o["id"], dict(lines=[dict(line_id=line["id"], qty=4)]))
         server.add_payment(self.conn, o["id"], dict(amount=100))
         d = server.dashboard(self.conn, {})
-        self.assertEqual(d["receivable"], 300)
+        self.assertEqual(d["receivable"], 320)  # 出貨 400 + 外加 5% 稅 20 − 已收 100
         self.assertEqual(d["month_sales"], 400)
 
     def test_order_numbers_increment(self):

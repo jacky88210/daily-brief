@@ -233,3 +233,50 @@ textarea { font: inherit; }
 .tabs { overflow-x: auto; }
 .tab { white-space: nowrap; }
 @media (max-width: 700px) { .tab { padding: 8px 10px; font-size: 15px; } }
+
+/* ---- 單據列印版面 */
+@media print {
+  html, body { background: #fff !important; }
+  #print-area { font-family: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif; font-size: 11pt; color: #000; }
+  .doc { position: relative; page-break-after: always; break-after: page; }
+  .doc:last-child { page-break-after: auto; break-after: auto; }
+  .doc-copy { position: absolute; top: 0; right: 0; border: 1px solid #000; padding: 1px 8px; font-size: 9pt; }
+  .doc-head { text-align: center; border-bottom: 2px solid #000; padding-bottom: 4px; margin-bottom: 6px; }
+  .doc-cname { font-size: 17pt; font-weight: 700; letter-spacing: 2px; }
+  .doc-cinfo { font-size: 9pt; }
+  .doc-title { font-size: 15pt; font-weight: 700; letter-spacing: 6px; margin-top: 2px; }
+  .doc-meta { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 6px; font-size: 10pt; }
+  .doc-party { flex: 1; }
+  .doc-no { text-align: right; white-space: nowrap; }
+  #print-area table.doc-table { width: 100%; border-collapse: collapse; }
+  #print-area .doc-table th, #print-area .doc-table td { border: 1px solid #000; padding: 3px 5px; font-size: 10pt; color: #000; vertical-align: top; }
+  #print-area .doc-table th { background: #eee !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; font-weight: 700; }
+  #print-area .doc-table small { font-size: 8.5pt; }
+  #print-area .num { text-align: right; }
+  #print-area .c { text-align: center; }
+  .doc-totals { display: flex; justify-content: space-between; align-items: flex-start; margin-top: 4px; gap: 12px; }
+  .doc-words { font-weight: 700; padding-top: 4px; }
+  .doc-totals table { border-collapse: collapse; min-width: 220px; }
+  .doc-totals td { border: 1px solid #000; padding: 2px 8px; font-size: 10pt; }
+  .doc-totals td:last-child { text-align: right; }
+  .doc-totals td.strong { font-weight: 700; font-size: 11pt; }
+  .doc-notes { margin-top: 6px; font-size: 9.5pt; }
+  .doc-wo { font-size: 11pt; line-height: 1.6; }
+  .doc-drawing { display: block; max-width: 100%; max-height: 95mm; margin: 6px auto 0; border: 1px solid #999; }
+  .doc-signs { display: flex; gap: 16px; margin-top: 14px; font-size: 10pt; }
+  .doc-signs div { flex: 1; white-space: nowrap; }
+  .doc-signs span { display: inline-block; width: 70%; border-bottom: 1px solid #000; height: 1.2em; vertical-align: bottom; }
+  /* 中一刀、A5：字小一點，一張印得下 */
+  .paper-HALF, .paper-A5 { font-size: 9pt !important; }
+  .paper-HALF .doc-cname, .paper-A5 .doc-cname { font-size: 13pt; }
+  .paper-HALF .doc-title, .paper-A5 .doc-title { font-size: 12pt; }
+  .paper-HALF .doc-table th, .paper-HALF .doc-table td, .paper-A5 .doc-table th, .paper-A5 .doc-table td { font-size: 8.5pt !important; padding: 1px 4px !important; }
+  .paper-HALF .doc-signs, .paper-A5 .doc-signs { margin-top: 6px; }
+  .paper-HALF .doc-drawing, .paper-A5 .doc-drawing { max-height: 45mm; }
+}
+@media print {
+  #print-area th, #print-area td { white-space: normal !important; }
+  #print-area .doc-table { table-layout: auto; word-break: break-all; }
+  .doc-copy { position: static; float: right; margin-left: 8px; }
+}
+td.nowrap, table button { white-space: nowrap; }

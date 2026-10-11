@@ -129,6 +129,23 @@ CREATE TABLE IF NOT EXISTS history (
 );
 CREATE INDEX IF NOT EXISTS idx_history_partner ON history(partner_id);
 CREATE INDEX IF NOT EXISTS idx_history_item ON history(item_code);
+-- 每次出貨 / 進貨一張單（可分批），單據列印用
+CREATE TABLE IF NOT EXISTS shipments (
+    id INTEGER PRIMARY KEY,
+    no TEXT NOT NULL UNIQUE,
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    ship_date TEXT NOT NULL,
+    note TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS shipment_lines (
+    id INTEGER PRIMARY KEY,
+    shipment_id INTEGER NOT NULL REFERENCES shipments(id) ON DELETE CASCADE,
+    order_line_id INTEGER NOT NULL REFERENCES order_lines(id),
+    item_id INTEGER NOT NULL REFERENCES items(id),
+    qty REAL NOT NULL,
+    unit_price REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ship_order ON shipments(order_id);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, created TEXT NOT NULL, last_seen TEXT NOT NULL, client TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_moves_item ON stock_moves(item_id);
@@ -152,7 +169,12 @@ MIGRATIONS = {
                  ("email", "TEXT DEFAULT ''"), ("owner", "TEXT DEFAULT ''"), ("reg_status", "TEXT DEFAULT ''"),
                  ("reg_capital", "TEXT DEFAULT ''"), ("reg_date", "TEXT DEFAULT ''"),
                  ("reg_checked", "TEXT DEFAULT ''")],
+    # 營業稅：exclusive = 外加、inclusive = 內含、none = 免稅（舊資料維持不含稅，金額不會變）
+    "orders": [("tax_type", "TEXT DEFAULT 'none'"), ("tax_rate", "REAL DEFAULT 5")],
 }
+TAX_TYPES = {"exclusive": "外加", "inclusive": "內含", "none": "免稅"}
+# 含稅總額 = 小計 × 這個係數（內含與免稅的單價本身就是總額）
+TAXF = "(CASE o.tax_type WHEN 'exclusive' THEN 1 + o.tax_rate / 100.0 ELSE 1 END)"
 ORDER_PREFIX = {"purchase": "PO", "sales": "SO"}
 
 
@@ -195,7 +217,8 @@ def today():
 # ---------------------------------------------------------------- 設定與登入
 
 PUBLIC_SETTINGS = ["company_name", "company_address", "company_phone", "company_fax", "company_tax_id",
-                   "hourly_rate", "workdays", "quote_terms"]
+                   "company_email", "bank_info", "hourly_rate", "workdays", "quote_terms",
+                   "tax_rate", "default_tax_type", "print_paper", "print_copies"]
 
 
 def get_setting(conn, key, default=""):
@@ -212,6 +235,9 @@ def get_settings(conn, q=None):
     out = {k: get_setting(conn, k) for k in PUBLIC_SETTINGS}
     out["hourly_rate"] = out["hourly_rate"] or "800"
     out["workdays"] = out["workdays"] or "123456"
+    out["tax_rate"] = out["tax_rate"] or "5"
+    out["default_tax_type"] = out["default_tax_type"] or "exclusive"
+    out["print_paper"] = out["print_paper"] or "A4"
     out["password_set"] = bool(get_setting(conn, "password_hash"))
     return out
 
@@ -526,7 +552,8 @@ def delete_partner(conn, pid):
 
 ORDER_SUMMARY_SQL = """
 SELECT o.*, p.name AS partner_name,
-       COALESCE((SELECT SUM(qty * unit_price) FROM order_lines WHERE order_id = o.id), 0) AS total,
+       COALESCE((SELECT SUM(qty * unit_price) FROM order_lines WHERE order_id = o.id), 0) AS subtotal,
+       ROUND(COALESCE((SELECT SUM(qty * unit_price) FROM order_lines WHERE order_id = o.id), 0) * """ + TAXF + """) AS total,
        COALESCE((SELECT SUM(amount) FROM payments WHERE order_id = o.id), 0) AS paid
 FROM orders o JOIN partners p ON p.id = o.partner_id
 """
@@ -551,7 +578,27 @@ def get_order(conn, oid):
            JOIN items i ON i.id = l.item_id WHERE l.order_id = ? ORDER BY l.id""", (oid,)))
     o["payments"] = rows(conn.execute(
         "SELECT * FROM payments WHERE order_id = ? ORDER BY pay_date, id", (oid,)))
+    o.update(tax_breakdown(o["subtotal"], o["tax_type"], o["tax_rate"]))
+    o["shipments"] = rows(conn.execute(
+        """SELECT s.*, COALESCE((SELECT SUM(qty * unit_price) FROM shipment_lines WHERE shipment_id = s.id), 0) AS subtotal
+           FROM shipments s WHERE s.order_id = ? ORDER BY s.id""", (oid,)))
     return o
+
+
+def tax_breakdown(subtotal, tax_type, rate):
+    """回傳 {tax_label, net, tax, total}：未稅金額、稅額、含稅總額（四捨五入到元）。"""
+    rate = (rate or 0) / 100
+    r = lambda x: int(x + 0.5) if x >= 0 else -int(-x + 0.5)  # 四捨五入（不用 Python 的銀行家捨入）
+    if tax_type == "exclusive":
+        tax = r(subtotal * rate)
+        net, total = subtotal, subtotal + tax
+    elif tax_type == "inclusive":
+        total = r(subtotal)
+        net = r(subtotal / (1 + rate))
+        tax = total - net
+    else:
+        net, tax, total = subtotal, 0, subtotal
+    return {"tax_label": TAX_TYPES.get(tax_type, "免稅"), "net": net, "tax": tax, "total": total}
 
 
 def clean_lines(conn, lines):
@@ -573,8 +620,13 @@ def save_order_header(conn, body, kind):
     expected = "supplier" if kind == "purchase" else "customer"
     if not partner or partner["type"] != expected:
         raise ApiError("請選擇" + ("供應商" if kind == "purchase" else "客戶"))
+    tax_type = body.get("tax_type") or get_setting(conn, "default_tax_type", "exclusive") or "exclusive"
+    if tax_type not in TAX_TYPES:
+        raise ApiError("稅別錯誤")
+    tax_rate = num(body.get("tax_rate") if body.get("tax_rate") not in (None, "") else (get_setting(conn, "tax_rate", "5") or 5),
+                   "稅率", 0)
     return (int(body["partner_id"]), body.get("order_date") or today(),
-            body.get("due_date", ""), body.get("customer_po", ""), body.get("note", ""))
+            body.get("due_date", ""), body.get("customer_po", ""), body.get("note", ""), tax_type, tax_rate)
 
 
 def create_order(conn, body):
@@ -585,8 +637,8 @@ def create_order(conn, body):
     lines = clean_lines(conn, body.get("lines"))
     no = next_no(conn, "orders", ORDER_PREFIX[kind])
     cur = conn.execute(
-        """INSERT INTO orders (kind, no, partner_id, order_date, due_date, customer_po, note)
-           VALUES (?,?,?,?,?,?,?)""", (kind, no) + header)
+        """INSERT INTO orders (kind, no, partner_id, order_date, due_date, customer_po, note, tax_type, tax_rate)
+           VALUES (?,?,?,?,?,?,?,?,?)""", (kind, no) + header)
     conn.executemany("INSERT INTO order_lines (order_id, item_id, qty, unit_price) VALUES (?,?,?,?)",
                      [(cur.lastrowid,) + ln for ln in lines])
     return {"id": cur.lastrowid, "no": no}
@@ -596,8 +648,8 @@ def update_order(conn, oid, body):
     o = get_order(conn, oid)
     if o["status"] == "cancelled":
         raise ApiError("已作廢的單據不能修改")
-    header = save_order_header(conn, body, o["kind"])
-    conn.execute("UPDATE orders SET partner_id=?, order_date=?, due_date=?, customer_po=?, note=? WHERE id=?",
+    header = save_order_header(conn, {"tax_type": o["tax_type"], "tax_rate": o["tax_rate"], **body}, o["kind"])
+    conn.execute("UPDATE orders SET partner_id=?, order_date=?, due_date=?, customer_po=?, note=?, tax_type=?, tax_rate=? WHERE id=?",
                  header + (oid,))
     if "lines" in body:
         if any(ln["delivered_qty"] for ln in o["lines"]):
@@ -620,6 +672,9 @@ def deliver_order(conn, oid, body):
         req = [{"line_id": ln["id"], "qty": ln["qty"] - ln["delivered_qty"]} for ln in o["lines"]]
     sign = 1 if o["kind"] == "purchase" else -1
     kind = "進貨" if o["kind"] == "purchase" else "出貨"
+    ship_no = next_no(conn, "shipments", "RC" if o["kind"] == "purchase" else "SH")
+    ship_id = conn.execute("INSERT INTO shipments (no, order_id, ship_date, note) VALUES (?,?,?,?)",
+                           (ship_no, oid, body.get("ship_date") or today(), body.get("note", ""))).lastrowid
     moved = 0
     for r in req:
         ln = by_id.get(int(r.get("line_id") or 0))
@@ -631,7 +686,9 @@ def deliver_order(conn, oid, body):
         remaining = ln["qty"] - ln["delivered_qty"]
         if qty > remaining + 1e-9:
             raise ApiError(f"{ln['code']} 超過未交數量 {remaining:g}")
-        add_move(conn, ln["item_id"], sign * qty, kind, o["no"], body.get("note", ""))
+        add_move(conn, ln["item_id"], sign * qty, kind, o["no"], ship_no)
+        conn.execute("INSERT INTO shipment_lines (shipment_id, order_line_id, item_id, qty, unit_price) VALUES (?,?,?,?,?)",
+                     (ship_id, ln["id"], ln["item_id"], qty, ln["unit_price"]))
         conn.execute("UPDATE order_lines SET delivered_qty = delivered_qty + ? WHERE id = ?",
                      (qty, ln["id"]))
         if o["kind"] == "purchase" and ln["unit_price"]:
@@ -642,7 +699,7 @@ def deliver_order(conn, oid, body):
     left = conn.execute("SELECT COUNT(*) FROM order_lines WHERE order_id = ? AND delivered_qty < qty - 1e-9",
                         (oid,)).fetchone()[0]
     conn.execute("UPDATE orders SET status = ? WHERE id = ?", ("done" if not left else "partial", oid))
-    return {"ok": True}
+    return {"ok": True, "shipment_id": ship_id, "shipment_no": ship_no}
 
 
 def add_payment(conn, oid, body):
@@ -666,7 +723,7 @@ def cancel_order(conn, oid):
 # ---------------------------------------------------------------- work orders
 
 WO_SQL = """
-SELECT w.*, i.code, i.name, i.unit, o.no AS sales_no, p.name AS customer
+SELECT w.*, i.code, i.name, i.unit, i.drawing_no, i.revision, i.material, i.finish, o.no AS sales_no, p.name AS customer
 FROM work_orders w JOIN items i ON i.id = w.item_id
 LEFT JOIN orders o ON o.id = w.sales_order_id
 LEFT JOIN partners p ON p.id = o.partner_id
@@ -963,8 +1020,8 @@ def dashboard(conn, q):
     balances = dict(conn.execute(
         """SELECT kind, COALESCE(SUM(MAX(delivered - paid, 0)), 0) FROM (
                SELECT o.kind,
-                      COALESCE((SELECT SUM(delivered_qty * unit_price) FROM order_lines
-                                WHERE order_id = o.id), 0) AS delivered,
+                      ROUND(COALESCE((SELECT SUM(delivered_qty * unit_price) FROM order_lines
+                                WHERE order_id = o.id), 0) * """ + TAXF + """) AS delivered,
                       COALESCE((SELECT SUM(amount) FROM payments WHERE order_id = o.id), 0) AS paid
                FROM orders o WHERE o.status != 'cancelled')
            GROUP BY kind""").fetchall())
@@ -1163,6 +1220,10 @@ ROUTES = [
     ("GET", r"/api/history", lambda c, q, b: list_history(c, q)),
     ("GET", r"/api/last-prices", lambda c, q, b: last_prices(c, q)),
     ("GET", r"/api/settings", lambda c, q, b: get_settings(c, q)),
+    ("GET", r"/api/shipments", lambda c, q, b: _m("documents").list_shipments(c, q)),
+    ("GET", r"/api/shipments/(\d+)", lambda c, q, b, i: _m("documents").get_shipment(c, int(i))),
+    ("GET", r"/api/statement", lambda c, q, b: _m("documents").statement(c, q)),
+    ("GET", r"/api/statement/partners", lambda c, q, b: _m("documents").statement_partners(c, q)),
     ("PUT", r"/api/settings", lambda c, q, b: save_settings(c, b)),
     ("POST", r"/api/settings/password", lambda c, q, b: set_password(c, b)),
     ("GET", r"/api/files", lambda c, q, b: _m("quotes").list_files(c, q.get("owner_type"), q.get("owner_id") or 0)),

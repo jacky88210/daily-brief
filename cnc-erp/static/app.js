@@ -201,6 +201,9 @@ async function render() {
   $$("#nav a, .mobilebar a").forEach((a) => a.classList.toggle("active", a.dataset.view === navView));
   const cur = $("#nav a.active");
   if (cur) cur.scrollIntoView({ block: "nearest", inline: "nearest" });
+  // 換頁時把還開著的彈出視窗關掉（例如從工單視窗點到客戶頁）
+  if (render.lastHash !== location.hash && $("#modal").open) $("#modal").close();
+  render.lastHash = location.hash;
   app.innerHTML = '<p class="muted">載入中…</p>';
   try {
     await (views[view] || views.dashboard)(arg);
@@ -697,7 +700,7 @@ views.partner = async (id) => {
   app.innerHTML = `
     <h1><a class="muted" style="cursor:pointer" id="back">${PTYPE[p.type]}</a> › ${esc(p.name)}
       ${p.grp ? `<span class="tag">${esc(p.grp)}</span>` : ""}
-      <span class="spacer"></span><button class="ghost" id="lookup">🔍 查公司登記</button>
+      <span class="spacer"></span><button class="ghost" id="stmt">🖨️ 對帳單</button><button class="ghost" id="lookup">🔍 查公司登記</button>
       <button class="ghost" id="edit">編輯資料</button>
       <button id="new-order">＋ ${isCus ? "開新訂單" : "開採購單"}</button></h1>
     ${regBad ? `<div class="card" style="background:var(--danger-bg)">⚠️ 經濟部登記狀態：<b>${esc(p.reg_status)}</b>，交易前請確認。</div>` : ""}
@@ -729,6 +732,7 @@ views.partner = async (id) => {
   $("#back").onclick = () => go("partners:" + p.type);
   $("#edit").onclick = () => partnerForm(p);
   $("#lookup").onclick = () => lookupPartner(p);
+  $("#stmt").onclick = () => statementForm(p);
   $("#new-order").onclick = () => orderForm(isCus ? "sales" : "purchase", null, p.id);
   $$("[data-search]").forEach((tr) => (tr.onclick = () => {
     views.history.state = { search: tr.dataset.search, kind: "", date_from: "", date_to: "" };
@@ -960,7 +964,7 @@ function orderListView(kind) {
         </select>
       </div>
       <div class="card">${table(
-        ["單號", k.partner, kind === "sales" ? "客戶單號" : "下單日", k.due, ["金額", "num"], ["未" + k.pay, "num"], "狀態"],
+        ["單號", k.partner, kind === "sales" ? "客戶單號" : "下單日", k.due, ["金額（含稅）", "num"], ["未" + k.pay, "num"], "狀態"],
         orders.map((o) => `<tr class="clickable" data-order="${o.id}">
           <td>${esc(o.no)}</td><td>${esc(o.partner_name)}</td>
           <td>${esc(kind === "sales" ? o.customer_po : o.order_date)}</td><td>${dueTag(o)}</td>
@@ -995,6 +999,8 @@ async function orderForm(kind, order, presetPartner) {
         ${field("下單日期", "order_date", o.order_date, 'type="date"')}
         ${field(k.due, "due_date", o.due_date, 'type="date"')}
         ${kind === "sales" ? field("客戶訂單號 / 圖號", "customer_po", o.customer_po) : ""}
+        ${selectField("營業稅", "tax_type", [["exclusive", "外加（單價未稅）"], ["inclusive", "內含（單價含稅）"], ["none", "免稅 / 不開發票"]],
+          o.tax_type || (settingsCache && settingsCache.default_tax_type) || "exclusive")}
         ${field("備註", "note", o.note, "", true)}
       </div>
       <h3 style="margin-top:16px">明細</h3>
@@ -1091,8 +1097,11 @@ async function showOrder(id) {
             <td>${active && left > 0 ? `<input type="number" step="any" min="0" max="${left}" value="${left}"
                 data-line="${l.id}" style="width:100px">` : ""}</td></tr>`;
         }))}
-      <p style="text-align:right">訂單金額 <b>${money(o.total)}</b>　已${k.deliver}金額 <b>${money(delivered)}</b>
-        　已${k.pay} <b>${money(o.paid)}</b>　未${k.pay} <b>${money(o.total - o.paid)}</b></p>
+      <p style="text-align:right">未稅 ${money(o.net)}　稅額（${esc(o.tax_label)}）${money(o.tax)}　訂單合計 <b>${money(o.total)}</b><br>
+        已${k.deliver}（未稅）<b>${money(delivered)}</b>　已${k.pay} <b>${money(o.paid)}</b>　未${k.pay} <b>${money(o.total - o.paid)}</b></p>
+      ${o.shipments.length ? `<h3>${k.deliver}單</h3>` + table(["日期", "單號", ["未稅金額", "num"], ""], o.shipments.map((s) => `<tr>
+        <td>${esc(s.ship_date)}</td><td>${esc(s.no)}</td><td class="num">${money(s.subtotal)}</td>
+        <td><button type="button" class="small ghost" data-ship="${s.id}">🖨️ 列印${k.deliver}單</button></td></tr>`)) : ""}
       ${o.payments.length ? `<h3>${k.pay}紀錄</h3>` + table(["日期", ["金額", "num"], "備註"],
         o.payments.map((p) => `<tr><td>${esc(p.pay_date)}</td><td class="num">${money(p.amount)}</td><td>${esc(p.note)}</td></tr>`)) : ""}
       <div class="actions" style="justify-content:flex-start">
@@ -1100,7 +1109,7 @@ async function showOrder(id) {
         ${o.status !== "cancelled" ? `<button type="button" class="ghost" id="pay">登記${k.pay}</button>` : ""}
         ${o.status !== "cancelled" ? `<button type="button" class="ghost" id="edit">修改</button>` : ""}
         ${o.kind === "sales" && active ? `<button type="button" class="ghost" id="mkwo">開工單</button>` : ""}
-        <button type="button" class="ghost" id="print">列印${o.kind === "sales" ? "出貨單" : "採購單"}</button>
+        <button type="button" class="ghost" id="print">🖨️ 列印${o.kind === "sales" ? "訂單確認單" : "採購單"}</button>
         ${o.status === "open" ? `<button type="button" class="ghost" id="cancel" style="color:var(--danger)">作廢</button>` : ""}
       </div>
       <p class="error" id="detail-error"></p>`,
@@ -1110,14 +1119,19 @@ async function showOrder(id) {
       if ($("#deliver")) $("#deliver").onclick = async () => {
         const lines = $$("[data-line]").map((i) => ({ line_id: i.dataset.line, qty: i.value || 0 }));
         if (!confirm(`確認${k.deliver}？庫存會自動${o.kind === "sales" ? "扣除" : "增加"}。`)) return;
-        try { await api("POST", `/api/orders/${o.id}/deliver`, { lines }); toast(k.deliver + "完成"); close(); }
-        catch (e) { err(e); }
+        try {
+          const r = await api("POST", `/api/orders/${o.id}/deliver`, { lines });
+          toast(`${k.deliver}完成，單號 ${r.shipment_no}`);
+          close();
+          if (confirm(`已產生${k.deliver}單 ${r.shipment_no}，要現在列印嗎？`)) printShipment(r.shipment_id);
+        } catch (e) { err(e); }
       };
       if ($("#pay")) $("#pay").onclick = () => paymentForm(o);
       if ($("#edit")) $("#edit").onclick = () => orderForm(o.kind, o);
       if ($("#mkwo")) $("#mkwo").onclick = () => workOrderForm({ sales_order_id: o.id, item_id: o.lines[0]?.item_id,
         qty: o.lines[0] ? o.lines[0].qty - o.lines[0].delivered_qty : "", due_date: o.due_date });
-      $("#print").onclick = () => printOrder(o);
+      $("#print").onclick = () => printOrderDoc(o);
+      $$("#modal [data-ship]").forEach((b) => (b.onclick = () => printShipment(b.dataset.ship)));
       if ($("#cancel")) $("#cancel").onclick = async () => {
         if (!confirm("確定作廢這張單？")) return;
         try { await api("POST", `/api/orders/${o.id}/cancel`); toast("已作廢"); close(); } catch (e) { err(e); }
@@ -1140,29 +1154,6 @@ function paymentForm(o) {
       refresh();
     },
   });
-}
-
-function printOrder(o) {
-  let area = $("#print-area");
-  if (!area) {
-    area = document.createElement("div");
-    area.id = "print-area";
-    document.body.appendChild(area);
-  }
-  const isSales = o.kind === "sales";
-  area.innerHTML = `
-    <h2>${isSales ? "出 貨 單" : "採 購 單"}</h2>
-    <p>單號：${esc(o.no)}　日期：${today()}　${isSales ? "客戶" : "供應商"}：${esc(o.partner_name)}
-      ${o.customer_po ? "　客戶單號：" + esc(o.customer_po) : ""}</p>
-    <table><thead><tr><th>料號</th><th>品名</th><th>規格</th><th>數量</th><th>單位</th><th>單價</th><th>金額</th></tr></thead>
-    <tbody>${o.lines.map((l) => `<tr><td>${esc(l.code)}</td><td>${esc(l.name)}</td><td>${esc(l.spec)}</td>
-      <td style="text-align:right">${n(l.qty)}</td><td>${esc(l.unit)}</td>
-      <td style="text-align:right">${n(l.unit_price)}</td><td style="text-align:right">${money(l.qty * l.unit_price)}</td></tr>`).join("")}
-    </tbody></table>
-    <p style="text-align:right">合計：${money(o.total)}</p>
-    ${o.note ? `<p>備註：${esc(o.note)}</p>` : ""}
-    <p style="margin-top:48px">${isSales ? "客戶簽收" : "廠商確認"}：＿＿＿＿＿＿＿＿　　經手人：＿＿＿＿＿＿＿＿</p>`;
-  window.print();
 }
 
 // ---------------------------------------------------------------- 工單
@@ -1263,14 +1254,16 @@ async function showWorkOrder(id) {
         ${w.status === "done" ? `<div><span>良品 / 不良</span>${n(w.good_qty)} / ${n(w.scrap_qty)}（${esc(w.finished)} 完工）</div>` : ""}
         ${w.note ? `<div><span>備註</span>${esc(w.note)}</div>` : ""}
       </div>
-      <h3>工序 <button type="button" class="small ghost" id="edit-ops" ${active ? "" : "hidden"}>編輯工序</button></h3>
+      <h3>工序 <button type="button" class="small ghost" id="edit-ops" ${active ? "" : "hidden"}>編輯工序</button>
+        <button type="button" class="small ghost" id="print-trav">🖨️ 列印製程卡</button></h3>
       ${table(["#", "工序", "機台 / 外包", ["完成", "num"], "狀態", ""], w.ops.map((o) => `<tr>
         <td>${o.seq}</td><td>${esc(o.process)}</td>
         <td>${o.outsource ? `🚚 ${esc(o.vendor || "未指定廠商")}${o.expected_back ? `（預計 ${esc(o.expected_back)} 回）` : ""}` : esc(o.machine || "未排機台")}</td>
         <td class="num">${n(o.good_qty)} / ${n(w.qty)}${o.scrap_qty ? ` <span class="muted">不良 ${n(o.scrap_qty)}</span>` : ""}</td>
         <td>${o.status === "done" ? '<span class="tag ok">完成</span>' : o.status === "doing" ? '<span class="tag warn">進行中</span>' : '<span class="tag">待做</span>'}</td>
         <td>${active && o.status !== "done" ? (o.outsource && !o.sent_date ? `<button type="button" class="small" data-send="${o.id}">送外包</button>`
-          : `<button type="button" class="small" data-report="${o.id}">${o.outsource ? "已回廠" : "報工"}</button>`) : ""}</td></tr>`), "沒有工序")}
+          : `<button type="button" class="small" data-report="${o.id}">${o.outsource ? "已回廠" : "報工"}</button>`) : ""}
+          ${o.outsource ? `<button type="button" class="small ghost" data-outprint="${o.id}">🖨️ 外包單</button>` : ""}</td></tr>`), "沒有工序")}
       ${w.files.length ? `<h3>圖面</h3>${gallery(w.files)}` : ""}
       <h3>用料</h3>
       ${table(["材料", ["每件用量", "num"], ["本單需求", "num"], ["目前庫存", "num"]], w.materials.map((m) => {
@@ -1296,6 +1289,8 @@ async function showWorkOrder(id) {
         reportForm(b.dataset.report, !!op.outsource, () => showWorkOrder(w.id));
       }));
       $$("#modal [data-send]").forEach((b) => (b.onclick = () => sendOutForm(b.dataset.send)));
+      $("#print-trav").onclick = () => printTraveler(w);
+      $$("#modal [data-outprint]").forEach((b) => (b.onclick = () => printOutsource(w.ops.find((o) => String(o.id) === b.dataset.outprint), w)));
       if ($("#edit-ops")) $("#edit-ops").onclick = () => routeEditor({
         title: `工單 ${w.no} 的工序`, ops: w.ops,
         hint: "注意：重新儲存會清除已回報的數量，建議只在還沒開始時調整。",
@@ -1566,34 +1561,9 @@ views.quote = async (id) => {
   if ($("#q-order")) $("#q-order").onclick = () => showOrder(q.sales_order_id);
   $("#q-print").onclick = act(async () => {
     await save();
-    printQuote(await api("GET", "/api/quotes/" + q.id), await api("GET", "/api/settings"));
+    printQuote(await api("GET", "/api/quotes/" + q.id));
   });
 };
-
-function printQuote(q, st) {
-  let area = $("#print-area");
-  if (!area) { area = document.createElement("div"); area.id = "print-area"; document.body.appendChild(area); }
-  const total = q.lines.reduce((s, l) => s + l.qty * l.unit_price, 0);
-  const p = q.partner || {};
-  area.innerHTML = `
-    <h2 style="margin-bottom:0">${esc(st.company_name || "")}</h2>
-    <p style="text-align:center;margin:4px 0">${esc(st.company_address || "")}　${st.company_phone ? "電話 " + esc(st.company_phone) : ""}
-      ${st.company_fax ? "　傳真 " + esc(st.company_fax) : ""}${st.company_tax_id ? "　統編 " + esc(st.company_tax_id) : ""}</p>
-    <h2>報 價 單</h2>
-    <p>客戶：${esc(p.name || q.customer_name)}　${p.contact || q.contact ? "聯絡人：" + esc(q.contact || p.contact) : ""}
-      ${p.phone ? "　電話：" + esc(p.phone) : ""}<br>
-      報價單號：${esc(q.no)}　報價日期：${esc(q.quoted_date || today())}　${q.valid_until ? "有效期限：" + esc(q.valid_until) : ""}</p>
-    <table><thead><tr><th>#</th><th>品名</th><th>圖號 / 版次</th><th>材質</th><th>表面 / 熱處理</th><th>數量</th><th>單價</th><th>金額</th><th>交期</th></tr></thead>
-    <tbody>${q.lines.map((l, i) => `<tr><td>${i + 1}</td><td>${esc(l.part_name)}</td><td>${esc(l.drawing_no)} ${esc(l.revision)}</td>
-      <td>${esc(l.material)}</td><td>${esc(l.finish)}</td><td style="text-align:right">${n(l.qty)}</td>
-      <td style="text-align:right">${n(l.unit_price)}</td><td style="text-align:right">${money(l.qty * l.unit_price)}</td>
-      <td>${l.lead_days ? n(l.lead_days) + " 天" : ""}</td></tr>`).join("")}</tbody></table>
-    <p style="text-align:right">合計（未稅）：${money(total)}</p>
-    ${q.note ? `<p>備註：${esc(q.note)}</p>` : ""}
-    <p style="white-space:pre-wrap">${esc(st.quote_terms || "1. 以上報價未含營業稅。\n2. 交期自確認訂單及收到正式圖面起算。")}</p>
-    <p style="margin-top:40px">客戶確認回簽：＿＿＿＿＿＿＿＿　　報價人：＿＿＿＿＿＿＿＿</p>`;
-  window.print();
-}
 
 // ---------------------------------------------------------------- 排程看板
 
@@ -1628,6 +1598,7 @@ views.schedule = async () => {
         ${o.sent_date ? `<span class="small">${esc(o.vendor || "")}　${esc(o.sent_date)} 送出，預計 <b class="${o.overdue ? "down" : ""}">${esc(o.expected_back)}</b> 回</span>
           <button type="button" class="small" data-back="${o.id}">已回廠</button>`
           : `<span class="small muted">尚未送出${o.vendor ? "（" + esc(o.vendor) + "）" : ""}</span><button type="button" class="small" data-send="${o.id}">送外包</button>`}
+        <button type="button" class="small ghost" data-outprint="${o.id}" data-wo-id="${o.wo_id}">🖨️ 外包單</button>
         <button type="button" class="small ghost" data-wo="${o.wo_id}">工單</button></div>`}
     </div>`;
   const late = s.work_orders.filter((w) => w.late);
@@ -1660,6 +1631,10 @@ views.schedule = async () => {
   });
   $$("[data-send]").forEach((b) => (b.onclick = () => sendOutForm(b.dataset.send)));
   $$("[data-back]").forEach((b) => (b.onclick = () => reportForm(b.dataset.back, true)));
+  $$("[data-outprint]").forEach((b) => (b.onclick = async () => {
+    const w = await api("GET", "/api/workorders/" + b.dataset.woId);
+    printOutsource(w.ops.find((o) => String(o.id) === b.dataset.outprint), w);
+  }));
 };
 
 async function machineManager() {
@@ -1833,6 +1808,302 @@ async function routeEditor({ title, ops, onSave, hint }) {
   });
 }
 
+// ---------------------------------------------------------------- 單據列印
+
+const PAPERS = {
+  A4: { label: "A4 直式", css: "size: A4 portrait; margin: 12mm 12mm 14mm;" },
+  A4L: { label: "A4 橫式", css: "size: A4 landscape; margin: 10mm;" },
+  A5: { label: "A5 橫式（A4 一半）", css: "size: A5 landscape; margin: 8mm;" },
+  HALF: { label: "中一刀（9.5×5.5 吋連續報表紙）", css: "size: 241mm 140mm; margin: 6mm 8mm;" },
+};
+
+// 金額大寫：12345 → 壹萬貳仟參佰肆拾伍元整
+function chineseAmount(v) {
+  let x = Math.round(Math.abs(Number(v) || 0));
+  if (!x) return "零元整";
+  const d = "零壹貳參肆伍陸柒捌玖", u = ["", "拾", "佰", "仟"], big = ["", "萬", "億", "兆"];
+  let out = "", g = 0, zero = false;
+  while (x > 0) {
+    const part = x % 10000;
+    x = Math.floor(x / 10000);
+    if (part) {
+      let s = "", z = false, p = part;
+      for (let i = 0; i < 4; i++) {
+        const k = p % 10;
+        p = Math.floor(p / 10);
+        if (k) { s = d[k] + u[i] + (z ? "零" : "") + s; z = false; } else if (s) z = true;
+      }
+      out = s + big[g] + (zero ? "零" : "") + out;
+      zero = part < 1000;
+    } else if (out) zero = true;
+    g++;
+  }
+  return (v < 0 ? "負" : "") + out.replace(/零+$/, "") + "元整";
+}
+
+let settingsCache = null;
+async function printSettings(force) {
+  if (!settingsCache || force) settingsCache = await api("GET", "/api/settings");
+  return settingsCache;
+}
+
+// 共同版型：公司抬頭、單據名稱、單號 / 日期、對象資料、明細、合計、簽名
+function docPage(st, { title, no, date, info = [], party, partyLabel, head, rows, totals, amountWords, notes, signs = [], extra = "" }) {
+  const p = party || {};
+  return `<div class="doc">
+    <div class="doc-head">
+      <div class="doc-company"><div class="doc-cname">${esc(st.company_name || "（請到「設定」填公司名稱）")}</div>
+        <div class="doc-cinfo">${[st.company_address, st.company_phone && "電話 " + st.company_phone, st.company_fax && "傳真 " + st.company_fax,
+          st.company_tax_id && "統編 " + st.company_tax_id, st.company_email].filter(Boolean).map(esc).join("　")}</div></div>
+      <div class="doc-title">${esc(title)}</div>
+    </div>
+    <div class="doc-meta">
+      <div class="doc-party">${partyLabel ? `<div><b>${esc(partyLabel)}：</b>${esc(p.name || "")}${p.tax_id ? `　統編 ${esc(p.tax_id)}` : ""}</div>
+        <div>${[p.address && "地址 " + p.address, p.phone && "電話 " + p.phone, p.fax && "傳真 " + p.fax, p.contact && "聯絡人 " + p.contact]
+          .filter(Boolean).map(esc).join("　")}</div>` : ""}</div>
+      <div class="doc-no"><div>單號：<b>${esc(no)}</b></div><div>日期：${esc(date)}</div>
+        ${info.filter((x) => x[1]).map(([k, v]) => `<div>${esc(k)}：${esc(v)}</div>`).join("")}</div>
+    </div>
+    <table class="doc-table"><thead><tr>${head.map((h) => `<th class="${h[1] || ""}">${h[0]}</th>`).join("")}</tr></thead>
+      <tbody>${rows.join("")}</tbody></table>
+    ${totals ? `<div class="doc-totals">${amountWords != null ? `<div class="doc-words">新台幣 ${chineseAmount(amountWords)}</div>` : "<div></div>"}
+      <table>${totals.map(([k, v, strong]) => `<tr><td>${esc(k)}</td><td class="${strong ? "strong" : ""}">${v}</td></tr>`).join("")}</table></div>` : ""}
+    ${extra}
+    ${notes ? `<div class="doc-notes">${notes}</div>` : ""}
+    ${signs.length ? `<div class="doc-signs">${signs.map((s) => `<div>${esc(s)}：<span></span></div>`).join("")}</div>` : ""}
+  </div>`;
+}
+
+// 列印：依設定的紙張大小，「一式多聯」時每聯各印一頁並標上聯別
+async function printPages(pages, { paper } = {}) {
+  const st = await printSettings();
+  const size = PAPERS[paper || st.print_paper] || PAPERS.A4;
+  let style = $("#print-page-style");
+  if (!style) { style = document.createElement("style"); style.id = "print-page-style"; document.head.appendChild(style); }
+  style.textContent = `@page { ${size.css} }`;
+  let area = $("#print-area");
+  if (!area) { area = document.createElement("div"); area.id = "print-area"; document.body.appendChild(area); }
+  const copies = (st.print_copies || "").split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (const page of pages) {
+    if (copies.length) copies.forEach((c) => out.push(page.replace('<div class="doc">', `<div class="doc"><div class="doc-copy">${esc(c)}</div>`)));
+    else out.push(page);
+  }
+  area.className = "paper-" + (paper || st.print_paper || "A4");
+  area.innerHTML = out.join("");
+  // 等圖片（製程卡的圖面）載入再印
+  await Promise.all($$("img", area).map((img) => img.complete ? null : new Promise((r) => { img.onload = img.onerror = r; })));
+  window.print();
+}
+
+const lineCells = (cells) => `<tr>${cells.map(([v, cls]) => `<td class="${cls || ""}">${v}</td>`).join("")}</tr>`;
+const padRows = (rows, cols, min) => rows.concat(Array(Math.max(0, min - rows.length)).fill(`<tr>${"<td>&nbsp;</td>".repeat(cols)}</tr>`));
+
+// ---- 出貨單 / 進貨單（每次出貨一張）
+async function shipmentPage(id) {
+  const [s, st] = await Promise.all([api("GET", "/api/shipments/" + id), printSettings()]);
+  const sales = s.kind === "sales";
+  const rows = s.lines.map((l, i) => lineCells([[i + 1, "c"], [esc(l.code)], [esc(l.name) + (l.spec ? `<br><small>${esc(l.spec)}</small>` : "")],
+    [esc([l.drawing_no, l.revision].filter(Boolean).join(" "))], [n(l.qty), "num"], [esc(l.unit), "c"], [n(l.unit_price), "num"],
+    [money(l.qty * l.unit_price), "num"], [n(l.delivered_qty) + " / " + n(l.order_qty), "num small"]]));
+  return docPage(st, {
+    title: sales ? "出 貨 單" : "進 貨 驗 收 單", no: s.no, date: s.ship_date, party: s.partner,
+    partyLabel: sales ? "客戶" : "供應商",
+    info: [["訂單號", s.order_no], ["客戶單號", s.customer_po], ["稅別", s.tax_label]],
+    head: [["#", "c"], ["料號"], ["品名 / 規格"], ["圖號 / 版次"], ["數量", "num"], ["單位", "c"], ["單價", "num"], ["金額", "num"], ["已交/訂購", "num"]],
+    rows: padRows(rows, 9, 6),
+    totals: [["未稅金額", money(s.net)], ["營業稅", money(s.tax)], ["合計", money(s.total), true]], amountWords: s.total,
+    notes: [s.note && "備註：" + esc(s.note), sales && st.bank_info && "匯款資訊：" + esc(st.bank_info)].filter(Boolean).join("<br>"),
+    signs: sales ? ["客戶簽收", "送貨人", "經辦"] : ["驗收", "經辦", "主管"],
+  });
+}
+async function printShipment(id) { await printPages([await shipmentPage(id)]); }
+
+// ---- 訂單確認單 / 採購單（整張訂單）
+async function printOrderDoc(o) {
+  const st = await printSettings();
+  const sales = o.kind === "sales";
+  const p = (await api("GET", `/api/partners?type=${sales ? "customer" : "supplier"}`)).find((x) => x.id === o.partner_id) || { name: o.partner_name };
+  const rows = o.lines.map((l, i) => lineCells([[i + 1, "c"], [esc(l.code)], [esc(l.name) + (l.spec ? `<br><small>${esc(l.spec)}</small>` : "")],
+    [n(l.qty), "num"], [esc(l.unit), "c"], [n(l.unit_price), "num"], [money(l.qty * l.unit_price), "num"]]));
+  await printPages([docPage(st, {
+    title: sales ? "訂 單 確 認 單" : "採 購 單", no: o.no, date: o.order_date, party: p, partyLabel: sales ? "客戶" : "供應商",
+    info: [[sales ? "交期" : "交貨日期", o.due_date], ["客戶單號", o.customer_po], ["稅別", o.tax_label]],
+    head: [["#", "c"], ["料號"], ["品名 / 規格"], ["數量", "num"], ["單位", "c"], ["單價", "num"], ["金額", "num"]],
+    rows: padRows(rows, 7, 6),
+    totals: [["未稅金額", money(o.net)], ["營業稅", money(o.tax)], ["合計", money(o.total), true]], amountWords: o.total,
+    notes: [o.note && "備註：" + esc(o.note), !sales && "請於交貨時附上出貨單，並註明本採購單號。"].filter(Boolean).join("<br>"),
+    signs: sales ? ["客戶確認回簽", "業務"] : ["廠商確認回簽", "採購", "主管"],
+  })]);
+}
+
+// ---- 報價單
+async function printQuote(q) {
+  const st = await printSettings(true);
+  const p = q.partner || { name: q.customer_name, contact: q.contact };
+  const total = q.lines.reduce((s, l) => s + l.qty * l.unit_price, 0);
+  const rows = q.lines.map((l, i) => lineCells([[i + 1, "c"], [esc(l.part_name)], [esc([l.drawing_no, l.revision].filter(Boolean).join(" "))],
+    [esc(l.material)], [esc(l.finish)], [n(l.qty), "num"], [n(l.unit_price), "num"], [money(l.qty * l.unit_price), "num"],
+    [l.lead_days ? n(l.lead_days) + " 天" : "", "c"]]));
+  await printPages([docPage(st, {
+    title: "報 價 單", no: q.no, date: q.quoted_date || today(), party: { ...p, contact: q.contact || p.contact }, partyLabel: "客戶",
+    info: [["有效期限", q.valid_until]],
+    head: [["#", "c"], ["品名"], ["圖號 / 版次"], ["材質"], ["表面 / 熱處理"], ["數量", "num"], ["單價", "num"], ["金額", "num"], ["交期", "c"]],
+    rows: padRows(rows, 9, 5),
+    totals: [["合計（未稅）", money(total), true]],
+    notes: [q.note && "備註：" + esc(q.note), esc(st.quote_terms || "1. 以上報價未含營業稅。\n2. 交期自確認訂單及收到正式圖面起算。").replace(/\n/g, "<br>")]
+      .filter(Boolean).join("<br>"),
+    signs: ["客戶確認回簽", "報價人"],
+  })]);
+}
+
+// ---- 工單製程卡（跟著零件在現場流動）
+async function printTraveler(w) {
+  const st = await printSettings();
+  const img = w.files.find((f) => isImage(f));
+  const rows = w.ops.map((o) => lineCells([[o.seq, "c"], [esc(o.process)],
+    [o.outsource ? "外包：" + esc(o.vendor || "") : esc(o.machine || "")],
+    [o.cycle_min ? n(o.cycle_min) + " 分/件" : "", "c"], ["", "c"], ["", "c"], ["", "num"], ["", "num"], [""], [""]]));
+  const mats = w.materials.map((m) => `${esc(m.code)} ${esc(m.name)} ${n(m.qty_per_unit * w.qty)} ${esc(m.unit)}`).join("　");
+  await printPages([docPage(st, {
+    title: "工 單 製 程 卡", no: w.no, date: w.created,
+    info: [["交期", w.due_date], ["訂單", [w.customer, w.sales_no].filter(Boolean).join(" ")]],
+    extra: "",
+    head: [["序", "c"], ["工序"], ["機台 / 外包"], ["標準工時", "c"], ["開始", "c"], ["完成", "c"], ["良品", "num"], ["不良", "num"], ["作業員"], ["檢驗"]],
+    rows: padRows(rows, 10, 5),
+    notes: `<div class="doc-wo">
+        <div><b>${esc(w.code)}　${esc(w.name)}</b></div>
+        <div>數量 <b>${n(w.qty)} ${esc(w.unit || "")}</b>　${w.drawing_no ? `圖號 <b>${esc(w.drawing_no)} ${esc(w.revision || "")}</b>　` : ""}
+          ${w.material ? `材質 <b>${esc(w.material)}</b>　` : ""}${w.finish ? `表面 / 熱處理 <b>${esc(w.finish)}</b>` : ""}</div>
+        ${mats ? `<div>用料：${mats}</div>` : ""}${w.note ? `<div>注意事項：${esc(w.note)}</div>` : ""}
+      </div>${img ? `<img class="doc-drawing" src="${fileUrl(img)}" alt="">` : ""}`,
+    signs: ["開單", "品管", "完工入庫"],
+  })]);
+}
+
+// ---- 外包加工單（送熱處理、電鍍…時交給廠商）
+async function printOutsource(o, w) {
+  const st = await printSettings();
+  const vendors = await api("GET", "/api/partners?type=supplier");
+  const v = vendors.find((x) => x.id === o.vendor_id) || { name: o.vendor || "" };
+  const qty = o.seq > 1 ? (w.ops.find((x) => x.seq === o.seq - 1) || {}).good_qty || w.qty : w.qty;
+  await printPages([docPage(st, {
+    title: "外 包 加 工 單", no: `${w.no}-${o.seq}`, date: o.sent_date || today(), party: v, partyLabel: "加工廠商",
+    info: [["預計回廠", o.expected_back], ["工單", w.no]],
+    head: [["料號"], ["品名"], ["圖號 / 版次"], ["材質"], ["加工內容"], ["送出數量", "num"], ["回廠數量", "num"], ["不良", "num"]],
+    rows: padRows([lineCells([[esc(w.code)], [esc(w.name)], [esc([w.drawing_no, w.revision].filter(Boolean).join(" "))], [esc(w.material || "")],
+      [esc(o.process) + (w.finish ? `（${esc(w.finish)}）` : ""), ""], [n(qty) + " " + esc(w.unit || ""), "num"], ["", "num"], ["", "num"]])], 8, 3),
+    notes: [o.note && "說明：" + esc(o.note), "回廠時請附本單，並註明實際數量與不良數。"].filter(Boolean).join("<br>"),
+    signs: ["廠商簽收", "送貨人", "回廠點收"],
+  })]);
+}
+
+// ---- 月結對帳單
+function statementPage(stt, s) {
+  const rows = [];
+  s.shipments.forEach((sh) => sh.lines.forEach((l, i) => rows.push(lineCells([[i ? "" : esc(sh.ship_date)], [i ? "" : esc(sh.no)],
+    [esc(l.code)], [esc(l.name)], [n(l.qty) + " " + esc(l.unit || ""), "num"], [n(l.unit_price), "num"], [money(l.qty * l.unit_price), "num"],
+    [i ? "" : (sh.tax ? money(sh.tax) : ""), "num"]]))));
+  s.payments.forEach((p) => rows.push(lineCells([[esc(p.pay_date)], ["收款"], [""], [esc(p.note || "") + `<small>（${esc(p.order_no)}）</small>`],
+    ["", "num"], ["", "num"], ["-" + money(p.amount), "num"], ["", "num"]])));
+  const sales = s.kind === "sales";
+  return docPage(stt, {
+    title: sales ? "對 帳 單" : "應 付 對 帳 單", no: `${s.date_from.slice(0, 7).replace("-", "")}-${s.partner.id}`, date: today(),
+    party: s.partner, partyLabel: sales ? "客戶" : "廠商", info: [["對帳期間", `${s.date_from} ～ ${s.date_to}`]],
+    head: [["日期"], ["單號"], ["料號"], ["品名"], ["數量", "num"], ["單價", "num"], ["金額", "num"], ["稅額", "num"]],
+    rows: rows.length ? rows : ['<tr><td colspan="8" class="c">本期沒有交易</td></tr>'],
+    totals: [["上期未結", money(s.prev_balance)], ["本期未稅", money(s.period.net)], ["本期稅額", money(s.period.tax)],
+      ["本期合計", money(s.period.total)], [sales ? "本期已收" : "本期已付", "-" + money(s.period.paid)],
+      [sales ? "本期應收" : "本期應付", money(s.balance), true]],
+    amountWords: s.balance,
+    notes: [sales && stt.bank_info && "匯款資訊：" + esc(stt.bank_info), "如有疑問請於收到後七日內告知，逾期視同無誤。"].filter(Boolean).join("<br>"),
+    signs: [sales ? "客戶確認" : "廠商確認", "經辦"],
+  });
+}
+
+async function printStatement(partnerId, from, to) {
+  const [s, st] = await Promise.all([
+    api("GET", `/api/statement?partner_id=${partnerId}&date_from=${from}&date_to=${to}`), printSettings()]);
+  await printPages([statementPage(st, s)]);
+}
+
+function monthRange(offset = 0) {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + offset);
+  const first = d.toLocaleDateString("sv-SE");
+  const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).toLocaleDateString("sv-SE");
+  return [first, last];
+}
+
+function statementForm(partner) {
+  const [f, t] = monthRange(-1);
+  modal({
+    title: `對帳單：${pname(partner)}`, ok: "列印",
+    body: `<div class="fields">${field("起日", "date_from", f, 'type="date"')}${field("迄日", "date_to", t, 'type="date"')}</div>
+      <p class="muted">預設是上個月。上期未結 + 本期出貨（含稅）− 本期收款 = 本期應收。</p>`,
+    onSubmit: async (form) => { const d = formData(form); await printStatement(partner.id, d.date_from, d.date_to); },
+  });
+}
+
+// ---- 單據列印中心：補印出貨單、批次列印對帳單
+views.docs = async () => {
+  const st = views.docs.state || (views.docs.state = { tab: "sales", search: "", date_from: monthRange(-1)[0], date_to: monthRange(0)[1] });
+  const [f, t] = monthRange(-1);
+  const ships = st.tab !== "statement" ? await api("GET", "/api/shipments?" + new URLSearchParams({ kind: st.tab, search: st.search, date_from: st.date_from, date_to: st.date_to })) : [];
+  const stm = st.tab === "statement" ? await api("GET", `/api/statement/partners?date_from=${st.sf || f}&date_to=${st.stt || t}`) : [];
+  app.innerHTML = `
+    <h1>單據列印</h1>
+    <div class="tabs">${[["sales", "出貨單"], ["purchase", "進貨單"], ["statement", "月結對帳單"]].map(([k, l]) =>
+      `<a class="tab ${st.tab === k ? "on" : ""}" data-tab="${k}">${l}</a>`).join("")}</div>
+    ${st.tab !== "statement" ? `
+      <div class="toolbar">
+        <input id="d-search" placeholder="搜尋單號、客戶、料號、品名、圖號" value="${esc(st.search)}" style="flex:1;min-width:200px">
+        <input type="date" id="d-from" value="${esc(st.date_from)}"><input type="date" id="d-to" value="${esc(st.date_to)}">
+        <button type="button" class="ghost" id="d-batch">🖨️ 列印勾選的</button>
+      </div>
+      <div class="card">${table([`<input type="checkbox" id="d-all">`, "日期", "單號", st.tab === "sales" ? "客戶" : "廠商", "訂單 / 客戶單號", "品項", ["含稅金額", "num"], ""],
+        ships.map((s) => `<tr><td><input type="checkbox" class="d-pick" value="${s.id}"></td><td class="nowrap">${esc(s.ship_date)}</td><td class="nowrap">${esc(s.no)}</td>
+          <td>${esc(s.partner)}</td><td>${esc(s.order_no)} ${esc(s.customer_po || "")}</td><td class="ellipsis">${esc(s.items || "")}</td>
+          <td class="num">${money(s.total)}</td><td><button type="button" class="small ghost" data-print="${s.id}">🖨️ 列印</button></td></tr>`),
+        "這段期間沒有單據。訂單按「確認出貨」時會自動產生出貨單。")}</div>`
+    : `
+      <div class="toolbar"><input type="date" id="s-from" value="${esc(st.sf || f)}"><input type="date" id="s-to" value="${esc(st.stt || t)}">
+        <button type="button" id="s-all">🖨️ 全部列印</button></div>
+      <p class="muted">列出這段期間有出貨、或還有未收款的客戶。</p>
+      <div class="card">${table(["客戶", ["出貨單數", "num"], ["本期含稅", "num"], ["本期已收", "num"], ["本期應收", "num"], ""],
+        stm.map((p) => `<tr><td>${esc(p.short_name || p.name)}</td><td class="num">${n(p.shipments)}</td><td class="num">${money(p.period_total)}</td>
+          <td class="num">${money(p.paid)}</td><td class="num"><b>${money(p.balance)}</b></td>
+          <td><button type="button" class="small ghost" data-stm="${p.id}">🖨️ 列印</button></td></tr>`), "這段期間沒有需要對帳的客戶")}</div>`}`;
+  $$("[data-tab]").forEach((a) => (a.onclick = () => { st.tab = a.dataset.tab; refresh(); }));
+  if (st.tab !== "statement") {
+    let timer;
+    $("#d-search").oninput = (e) => { clearTimeout(timer); timer = setTimeout(() => { st.search = e.target.value; refresh(); }, 350); };
+    if (st.search) { $("#d-search").focus(); $("#d-search").setSelectionRange(st.search.length, st.search.length); }
+    $("#d-from").onchange = (e) => { st.date_from = e.target.value; refresh(); };
+    $("#d-to").onchange = (e) => { st.date_to = e.target.value; refresh(); };
+    $$("[data-print]").forEach((b) => (b.onclick = () => printShipment(b.dataset.print)));
+    $("#d-all").onclick = (e) => $$(".d-pick").forEach((c) => (c.checked = e.target.checked));
+    $("#d-batch").onclick = async () => {
+      const ids = $$(".d-pick:checked").map((c) => c.value);
+      if (!ids.length) return alert("請先勾選要列印的單據");
+      await printPages(await Promise.all(ids.map(shipmentPage)));
+    };
+  } else {
+    const sf = () => $("#s-from").value, stt = () => $("#s-to").value;
+    $("#s-from").onchange = () => { st.sf = sf(); refresh(); };
+    $("#s-to").onchange = () => { st.stt = stt(); refresh(); };
+    $$("[data-stm]").forEach((b) => (b.onclick = () => printStatement(b.dataset.stm, sf(), stt())));
+    $("#s-all").onclick = async () => {
+      if (!stm.length) return;
+      const set = await printSettings();
+      const pages = await Promise.all(stm.map((p) => api("GET", `/api/statement?partner_id=${p.id}&date_from=${sf()}&date_to=${stt()}`)
+        .then((s) => statementPage(set, s))));
+      await printPages(pages);
+    };
+  }
+};
+
 // ---------------------------------------------------------------- 凌越備份轉入
 
 const LY_KINDS = [["sales", "銷貨"], ["sales_return", "銷貨退回"], ["purchase", "進貨"],
@@ -1964,15 +2235,21 @@ views.tools = async () => {
           ${field("統一編號", "company_tax_id", st.company_tax_id)}
           ${field("電話", "company_phone", st.company_phone)}
           ${field("傳真", "company_fax", st.company_fax)}
+          ${field("Email", "company_email", st.company_email)}
           ${field("地址", "company_address", st.company_address, "", true)}
+          ${field("匯款資訊（印在出貨單、對帳單）", "bank_info", st.bank_info, 'placeholder="例：台灣銀行 台中分行 帳號 123-456-789 戶名 XX精密"', true)}
           <label class="wide">報價單條款<textarea name="quote_terms" rows="3">${esc(st.quote_terms || "1. 以上報價未含營業稅。\n2. 交期自確認訂單及收到正式圖面起算。")}</textarea></label>
           <div class="wide"><button type="submit">儲存</button></div>
         </form></div>
-      <div class="card"><h3>⏱️ 報價與排程</h3>
+      <div class="card"><h3>⏱️ 報價、排程與單據</h3>
         <form id="set-prod" class="fields">
           ${field("加工工時費率（元 / 小時）", "hourly_rate", st.hourly_rate, 'type="number" step="any" min="0"')}
           <label class="wide">工作日（排程估算用）<span class="daypick">${[...days].map((c, i) =>
             `<label class="inline"><input type="checkbox" value="${i + 1}" ${st.workdays.includes(String(i + 1)) ? "checked" : ""} style="width:auto"> ${c}</label>`).join("")}</span></label>
+          ${field("營業稅率 %", "tax_rate", st.tax_rate, 'type="number" step="any" min="0"')}
+          ${selectField("新訂單預設稅別", "default_tax_type", [["exclusive", "外加"], ["inclusive", "內含"], ["none", "免稅"]], st.default_tax_type)}
+          ${selectField("單據紙張", "print_paper", Object.entries(PAPERS).map(([k, v]) => [k, v.label]), st.print_paper)}
+          ${field("一式多聯（逗號分隔，空白 = 一張）", "print_copies", st.print_copies, 'placeholder="例：第一聯 客戶聯,第二聯 存根聯"')}
           <div class="wide"><button type="submit">儲存</button> <button type="button" class="ghost" id="set-mach">⚙️ 機台設定</button></div>
         </form></div>
       <div class="card"><h3>🔒 登入密碼 ${st.password_set ? '<span class="tag ok">已設定</span>' : '<span class="tag danger">未設定</span>'}</h3>
@@ -2042,6 +2319,7 @@ views.tools = async () => {
     e.preventDefault();
     try {
       await api("PUT", "/api/settings", { ...formData(e.target), ...(extra ? extra() : {}) });
+      settingsCache = null;
       toast("已儲存");
     } catch (err) { alert(err.message); }
   });
