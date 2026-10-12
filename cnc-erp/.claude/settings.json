@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m unittest:*)",
+      "Bash(python3 -m unittest:*)",
+      "Bash(py -3 -m unittest:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ],
+    "deny": [
+      "Read(./cnc.db)",
+      "Read(./cnc.db-journal)",
+      "Read(./files/**)",
+      "Read(./pre-update/**)",
+      "Read(./data/**)",
+      "Read(./**/*.001)",
+      "Read(./lingyue_upload.001)"
+    ]
+  }
+}

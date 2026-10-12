@@ -12,3 +12,5 @@ demo.db
 lingyue_upload.001*
 files/
 data/
+server.pid
+pre-update/

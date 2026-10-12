@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
 ADMIN_ONLY = [
     (None, r"/api/users(/.*)?"),
     ("PUT", r"/api/settings"),
+    ("GET", r"/api/system"),
     (None, r"/api/backup(/.*)?"),
     (None, r"/api/lingyue/.*"),
     (None, r"/api/import"),

@@ -87,6 +87,10 @@ async function loadMe() {
   const chip = $("#userchip");
   chip.hidden = !me;
   if (me) chip.textContent = `👤 ${me.display_name}${me.local ? "" : `（${me.role_label}）`}`;
+  if (st.brand) {
+    $(".brand").textContent = st.brand;
+    document.title = st.brand;
+  }
   const only = me && ROLE_VIEWS[me.role];
   $$("#nav a, .mobilebar a").forEach((a) => (a.hidden = !!only && !only.includes(a.dataset.view)));
   return st;
@@ -2350,9 +2354,10 @@ views.tools = async () => {
   app.innerHTML = `
     <h1>設定 / 匯入 / 備份</h1>
     <div class="grid">
-      <div class="card"><h3>🏢 公司資料（印在報價單上）</h3>
+      <div class="card"><h3>🏢 公司資料（顯示在系統上方、印在所有單據上）</h3>
         <form id="set-company" class="fields">
-          ${field("公司名稱", "company_name", st.company_name)}
+          ${field("公司名稱（單據抬頭用全名）", "company_name", st.company_name, 'placeholder="例：鴻興精密機械有限公司"')}
+          ${field("系統上方顯示的名稱（可用簡稱，空白 = 公司名稱）", "brand_name", st.brand_name, 'placeholder="例：鴻興精密"')}
           ${field("統一編號", "company_tax_id", st.company_tax_id)}
           ${field("電話", "company_phone", st.company_phone)}
           ${field("傳真", "company_fax", st.company_fax)}
@@ -2403,6 +2408,7 @@ views.tools = async () => {
           ${b.ok ? '<span class="tag ok">正常</span>' : '<span class="tag danger">失敗</span>'} ${esc(b.time)}　${esc(d)}
           ${b.ok ? `<span class="muted">（${n(Math.round((b.size || 0) / 1024))} KB）</span>` : `<br><span class="down">${esc(b.error)}</span>`}</div>`).join("")
           || '<p class="small down">⚠️ 還沒設定自動備份。商業資料請至少設定兩個備份位置。</p>'}</div></div>
+      <div class="card"><h3>ℹ️ 系統資訊</h3><div id="sysinfo" class="small"><button type="button" class="small ghost" id="sys-load">顯示</button></div></div>
       <div class="card"><h3>📋 存取紀錄</h3>
         <p class="muted small">登入、登入失敗、改密碼、下載備份、備份失敗都會記錄。看到不認識的 IP 或大量登入失敗，請立即更換密碼。</p>
         <div id="audit" class="small"><button type="button" class="small ghost" id="audit-load">顯示最近紀錄</button></div></div>
@@ -2458,7 +2464,15 @@ views.tools = async () => {
       toast("已儲存");
     } catch (err) { alert(err.message); }
   });
-  saveForm("set-company");
+  $("#set-company").onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      await api("PUT", "/api/settings", formData(e.target));
+      settingsCache = null;
+      await loadMe();
+      toast("已儲存，系統上方的名稱也更新了");
+    } catch (err) { alert(err.message); }
+  };
   saveForm("set-backup");
   $("#backup-now").onclick = async () => {
     $("#backup-status").innerHTML = '<p class="small muted">備份中…</p>';
@@ -2469,6 +2483,15 @@ views.tools = async () => {
       toast(bad.length ? "有備份位置失敗，請看下方訊息" : "備份完成並已驗證");
     } catch (err) { alert(err.message); }
     refresh();
+  };
+  $("#sys-load").onclick = async () => {
+    const i = await api("GET", "/api/system");
+    const mb = (b) => (b / 1048576).toFixed(1) + " MB";
+    $("#sysinfo").innerHTML = `<div class="detail-head">
+      <div><span>系統版本</span>${esc(i.version)}</div><div><span>Python</span>${esc(i.python)}</div>
+      <div><span>資料庫</span>${mb(i.db_size)}</div><div><span>圖面附件</span>${n(i.files)} 個（${mb(i.files_size)}）</div>
+      <div style="grid-column:1/-1"><span>資料庫位置</span><code>${esc(i.db_path)}</code></div>
+      <div style="grid-column:1/-1"><span>筆數</span>${Object.entries(i.counts).map(([k, v]) => `${esc(k)} ${n(v)}`).join("　")}</div></div>`;
   };
   if ($("#audit-load")) $("#audit-load").onclick = async () => {
     const list = await api("GET", "/api/audit");

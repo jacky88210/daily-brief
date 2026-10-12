@@ -224,7 +224,7 @@ def today():
 
 # ---------------------------------------------------------------- 設定與登入
 
-PUBLIC_SETTINGS = ["company_name", "company_address", "company_phone", "company_fax", "company_tax_id",
+PUBLIC_SETTINGS = ["brand_name", "company_name", "company_address", "company_phone", "company_fax", "company_tax_id",
                    "company_email", "bank_info", "hourly_rate", "workdays", "quote_terms",
                    "tax_rate", "default_tax_type", "print_paper", "print_copies", "backup_dir", "backup_dir2", "backup_keep"]
 
@@ -237,6 +237,37 @@ def get_setting(conn, key, default=""):
 def set_setting(conn, key, value):
     conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                  (key, value))
+
+
+def _read_version():
+    try:
+        with open(os.path.join(BASE_DIR, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return "dev"
+
+
+VERSION = _read_version()
+
+
+def brand_name(conn):
+    """畫面上方顯示的名稱：「系統顯示名稱」→ 公司名稱 → 預設。登入前也會顯示，所以只回傳名稱。"""
+    return (get_setting(conn, "brand_name") or get_setting(conn, "company_name") or "CNC 進銷存").strip()
+
+
+def system_info(conn):
+    files_root = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "files")
+    n_files = size_files = 0
+    for root, _, names in os.walk(files_root):
+        for name in names:
+            n_files += 1
+            size_files += os.path.getsize(os.path.join(root, name))
+    count = lambda t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    return {"version": VERSION, "python": sys.version.split()[0], "sqlite": sqlite3.sqlite_version,
+            "db_path": os.path.abspath(DB_PATH), "db_size": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0,
+            "files": n_files, "files_size": size_files, "program_dir": BASE_DIR,
+            "counts": {k: count(t) for k, t in (("品項", "items"), ("客戶 / 廠商", "partners"), ("訂單", "orders"),
+                                                ("報價", "quotes"), ("工單", "work_orders"), ("歷史紀錄", "history"))}}
 
 
 def get_settings(conn, q=None):
@@ -1305,6 +1336,35 @@ def start_backup_thread():
     threading.Thread(target=loop, daemon=True, name="auto-backup").start()
 
 
+def data_dir():
+    return os.path.dirname(os.path.abspath(DB_PATH))
+
+
+def save_snapshot(keep=10):
+    """更新程式前的快照：存在資料夾內 pre-update\，保留最近 10 份。會先驗證能還原。"""
+    from datetime import datetime
+    data = backup_bytes()
+    verify_backup(data)
+    folder = os.path.join(data_dir(), "pre-update")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"cnc-before-update-{datetime.now():%Y%m%d-%H%M%S}.zip")
+    with open(path, "wb") as f:
+        f.write(data)
+    old = sorted(n for n in os.listdir(folder) if n.startswith("cnc-before-update-") and n.endswith(".zip"))
+    for n in old[:-keep]:
+        os.remove(os.path.join(folder, n))
+    return path
+
+
+def write_pid():
+    """記下目前執行中系統的程序編號，update.bat 用它來重啟系統。"""
+    try:
+        with open(os.path.join(data_dir(), "server.pid"), "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
 def on_network_share(path):
     """資料庫放在網路磁碟（\\\\NAS\\... 或對應的磁碟機）上很容易損毀。"""
     p = os.path.abspath(path)
@@ -1379,6 +1439,7 @@ ROUTES = [
     ("GET", r"/api/history", lambda c, q, b: list_history(c, q)),
     ("GET", r"/api/last-prices", lambda c, q, b: last_prices(c, q)),
     ("GET", r"/api/settings", lambda c, q, b: get_settings(c, q)),
+    ("GET", r"/api/system", lambda c, q, b: system_info(c)),
     ("GET", r"/api/shipments", lambda c, q, b: _m("documents").list_shipments(c, q)),
     ("GET", r"/api/shipments/(\d+)", lambda c, q, b, i: _m("documents").get_shipment(c, int(i))),
     ("GET", r"/api/statement", lambda c, q, b: _m("documents").statement(c, q)),
@@ -1510,7 +1571,7 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/auth/status":
                     return 200, {"required": required, "logged_in": bool(user) if required else local,
                                  "setup_needed": not required and not local, "local": local,
-                                 "user": accounts.public(user)}, {}
+                                 "user": accounts.public(user), "brand": brand_name(conn), "version": VERSION}, {}
                 if url.path == "/api/auth/setup" and method == "POST":
                     if login_locked(ip):
                         return 429, {"error": f"嘗試太多次，請 {LOCK_MINUTES} 分鐘後再試"}, {}
@@ -1681,10 +1742,15 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--lan", action="store_true", help="開放區網內其他電腦連線")
     ap.add_argument("--demo", action="store_true", help="資料庫是空的時候，放入示範資料")
+    ap.add_argument("--snapshot", action="store_true", help="更新程式前用：在資料夾內存一份快照備份（pre-update）")
     ap.add_argument("--reset-admin", "--reset-password", action="store_true", dest="reset_admin",
                     help="忘記管理員密碼時用：產生一組臨時密碼")
     args = ap.parse_args()
     init_db()
+    if args.snapshot:
+        path = save_snapshot()
+        print(f"已備份：{path}")
+        return
     if args.reset_admin:
         import accounts
         conn = connect()
@@ -1720,6 +1786,7 @@ def main():
         if not has:
             print("【注意】還沒有建立帳號：其他電腦 / 手機連線時會被要求先建立管理員帳號，建立前看不到任何資料。")
     start_backup_thread()
+    write_pid()
     print("關閉此視窗即停止系統")
     try:
         srv.serve_forever()
