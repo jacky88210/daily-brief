@@ -2399,7 +2399,7 @@ views.tools = async () => {
         <p class="muted">每天自動備份資料庫和所有圖面到<b>兩個不同地方</b>（例：NAS 資料夾 + 外接硬碟 / 另一顆硬碟），
           寫完會自動驗證備份可以還原。任一處故障，另一處還有完整資料。</p>
         <form id="set-backup" class="fields">
-          ${field("備份位置 1（建議 NAS）", "backup_dir", st.backup_dir, 'placeholder="例：\\\\YHH\\homes\\HSU_HOME\\公司\\系統備份"', true)}
+          ${field("備份位置 1（建議 NAS）", "backup_dir", st.backup_dir, 'placeholder="例：\\\\NAS名稱\\homes\\公司共用\\資料夾\\系統備份"', true)}
           ${field("備份位置 2（建議外接硬碟或另一顆硬碟）", "backup_dir2", st.backup_dir2, 'placeholder="例：E:\\系統備份"', true)}
           ${field("保留最近幾天", "backup_keep", st.backup_keep, 'type="number" min="1" step="1"')}
           <div class="wide"><button type="submit">儲存</button> <button type="button" class="ghost" id="backup-now">立即備份並驗證</button></div>
@@ -2503,7 +2503,7 @@ views.tools = async () => {
   $("#set-mach").onclick = () => machineManager();
   if (st.has_users) loadUsers();
   $("#user-add").onclick = () => (st.has_users ? userForm() : showLogin(true).then(refresh));
-  $("#ly-path").placeholder = "例：\\\\YHH\\homes\\HSU_HOME\\公司\\wstkBKUP.001";
+  $("#ly-path").placeholder = "例：\\\\NAS名稱\\homes\\公司共用\\資料夾\\wstkBKUP.001";
   wireLingyue();
   const imp = { file: null, data: null, mapping: null, header_row: null };
   const out = $("#imp-result");
