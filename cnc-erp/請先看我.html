@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CNC 進銷存：開始使用</title>
+<style>
+  :root { --ink: #1d2330; --muted: #5b6472; --line: #dfe3e8; --brand: #1f5fa8; --soft: #eef4fb; --warn: #fff6e5; --warn-ink: #8a5a00; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f4f5f7; color: var(--ink); font: 17px/1.7 "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 28px; margin: 8px 0 4px; }
+  h2 { font-size: 21px; margin: 32px 0 10px; padding-top: 12px; border-top: 2px solid var(--line); }
+  .lead { color: var(--muted); margin-top: 0; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; margin: 12px 0; }
+  ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; }
+  ol.steps > li { counter-increment: s; position: relative; padding: 12px 0 12px 52px; border-bottom: 1px dashed var(--line); }
+  ol.steps > li:last-child { border-bottom: 0; }
+  ol.steps > li::before { content: counter(s); position: absolute; left: 0; top: 12px; width: 36px; height: 36px; border-radius: 50%;
+    background: var(--brand); color: #fff; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+  code, .file { background: var(--soft); color: var(--brand); padding: 1px 6px; border-radius: 6px; font-family: Consolas, monospace; font-size: 15px; white-space: nowrap; }
+  .warn { background: var(--warn); color: var(--warn-ink); border-radius: 10px; padding: 10px 14px; margin: 10px 0; }
+  .who { display: inline-block; font-size: 13px; padding: 1px 10px; border-radius: 99px; background: var(--soft); color: var(--brand); margin-left: 6px; vertical-align: middle; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+  th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-size: 15px; }
+  small { color: var(--muted); }
+  @media print { body { background: #fff; font-size: 13px; } .card { break-inside: avoid; } h2 { break-after: avoid; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>CNC 進銷存系統：開始使用</h1>
+  <p class="lead">報價、訂單、出貨、庫存、生產排程、單據列印。系統裝在<b>公司一台電腦</b>上，其他人用瀏覽器或手機連線使用，<b>不用每台都安裝</b>。</p>
+
+  <h2>一、安裝（只要做一次）<span class="who">負責的人</span></h2>
+  <div class="card">
+    <p>選一台<b>白天都會開機</b>的辦公室電腦（Windows 10 / 11）。</p>
+    <ol class="steps">
+      <li><b>解壓縮</b>：在 zip 檔上按右鍵 →「內容」→ 勾選右下角「<b>解除封鎖</b>」→ 確定（之後執行比較不會被 Windows 擋）。
+        再按右鍵 →「<b>解壓縮全部</b>」，放到本機硬碟，例如 <code>D:\cnc-erp</code>。<br>
+        <small>不要放在 NAS 或隨身碟上執行；也不要直接在 zip 裡面點兩下。</small></li>
+      <li><b>安裝 Python</b>（系統需要它）：雙擊 <span class="file">install-python.bat</span>，等 1～3 分鐘，看到「安裝完成」就<b>關掉視窗</b>。<br>
+        <small>電腦已經有 Python 會直接告訴你，可以跳過。</small></li>
+      <li><b>設定開機自動執行</b>：雙擊 <span class="file">install-autostart.bat</span>。完成後：
+        <ul>
+          <li>工作列會多一個縮小的「CNC 進銷存（背景執行中）」視窗：<b>不要關掉它</b>。</li>
+          <li>桌面會多一個「CNC 進銷存」捷徑。</li>
+          <li>如果 Windows 防火牆詢問，請按「<b>允許</b>」（其他電腦、手機才連得到）。</li>
+        </ul></li>
+      <li><b>電源設定</b>：Windows「設定 → 系統 → 電源」，把「睡眠」改成「<b>永不</b>」（螢幕可以關）。</li>
+      <li><b>建立管理員帳號</b>：點桌面捷徑打開系統，第一次會要求建立管理員（通常是老闆）的帳號與密碼。</li>
+    </ol>
+    <div class="warn">⚠️ 看到藍色視窗「Windows 已保護您的電腦」：按「<b>其他資訊</b>」→「<b>仍要執行</b>」。這是 Windows 對網路下載檔案的一般提醒。</div>
+  </div>
+
+  <h2>二、第一次設定<span class="who">管理員</span></h2>
+  <div class="card">
+    <p>打開系統 → 上方選單「<b>設定/匯入</b>」：</p>
+    <ol class="steps">
+      <li><b>公司資料</b>：公司名稱、統編、電話、地址、匯款帳號（印在所有單據上）；「系統上方顯示的名稱」可填簡稱。</li>
+      <li><b>使用者帳號</b>：幫每個人開一個帳號（不要共用）。
+        <table>
+          <tr><th>角色</th><th>適合誰</th><th>能用的功能</th></tr>
+          <tr><td>管理員</td><td>老闆</td><td>全部，含帳號、設定、備份</td></tr>
+          <tr><td>辦公室人員</td><td>主管、業務、會計</td><td>報價、訂單、採購、庫存、客戶、排程、單據</td></tr>
+          <tr><td>現場人員</td><td>師傅</td><td>只有現場報工、排程、看圖面（看不到價格）</td></tr>
+        </table></li>
+      <li><b>自動備份</b>：位置 1 填 NAS 資料夾、位置 2 填外接硬碟（例 <code>E:\系統備份</code>），按「<b>立即備份並驗證</b>」，兩個都要顯示「正常」。<br>
+        <small>NAS 要先在檔案總管登入一次並勾「記住我的認證」。</small></li>
+      <li><b>從凌越轉入資料</b>：在凌越做一次備份，把 <code>wstkBKUP.001</code> 交給「從凌越備份檔一次轉入」，確認後按「開始轉入」。</li>
+      <li><b>機台</b>：「排程 → 機台設定」建立你們的機台與每天可用時數。</li>
+    </ol>
+  </div>
+
+  <h2>三、其他人怎麼用<span class="who">所有人</span></h2>
+  <div class="card">
+    <table>
+      <tr><th>在哪裡</th><th>怎麼開</th></tr>
+      <tr><td>系統那台電腦</td><td>點桌面「CNC 進銷存」</td></tr>
+      <tr><td>公司內其他電腦 / 手機（同一個 Wi-Fi）</td><td>瀏覽器輸入 <code>http://系統電腦的IP:8080</code><br>
+        <small>IP 查法：在系統電腦按「開始」輸入 cmd → 輸入 <code>ipconfig</code> → 看「IPv4 位址」，例如 192.168.1.20</small></td></tr>
+      <tr><td>在外面用手機</td><td>系統電腦和手機都安裝 <b>Tailscale</b>，手機開 <code>http://系統電腦的Tailscale位址:8080</code><br>
+        <small>不要在路由器開 port 把系統公開到網路上。</small></td></tr>
+    </table>
+    <p>用自己的帳號登入；手機可在瀏覽器選「<b>加入主畫面</b>」，以後像 App 一樣點開。忘記密碼請找管理員重設。</p>
+  </div>
+
+  <h2>四、建議的導入方式</h2>
+  <div class="card">
+    <ol class="steps">
+      <li><b>試行 2～4 週</b>：凌越照常用，新系統平行跑，先由一位主管用報價、查歷史價格、看總覽。</li>
+      <li><b>教育訓練</b>：每人用自己的帳號，雙擊 <span class="file">demo.bat</span> 用示範資料練習（不會弄亂正式資料；練習前先關掉正式系統的視窗）。</li>
+      <li><b>正式切換</b>：選一個月初，前一晚凌越最後備份一次 → 新系統再轉入一次 → 盤點庫存；隔天起只用新系統開單。凌越資料至少保留一年。</li>
+    </ol>
+  </div>
+
+  <h2>五、每天 / 每月要注意</h2>
+  <div class="card">
+    <ul>
+      <li>每天打開「<b>總覽</b>」：最上方如果出現紅色「備份需要注意」，請管理員處理。</li>
+      <li>列印單據時，列印視窗的「<b>頁首和頁尾</b>」取消勾選（不然紙上會多印網址）。</li>
+      <li>每月：「單據列印 → 月結對帳單」。</li>
+      <li>更新新版：維護的人會告訴你；用 git 安裝的雙擊 <span class="file">update.bat</span>（自動備份、檢查，失敗自動退回）。</li>
+    </ul>
+  </div>
+
+  <h2>遇到問題</h2>
+  <div class="card">
+    <table>
+      <tr><td>打不開網頁</td><td>看系統電腦工作列上的「CNC 進銷存」視窗還在不在；不在就點兩下桌面捷徑旁的 <span class="file">start.bat</span>。</td></tr>
+      <tr><td>其他電腦連不到</td><td>確認在同一個網路、IP 打對、防火牆有允許；系統電腦不能睡眠。</td></tr>
+      <tr><td>管理員忘記密碼</td><td>在系統電腦的程式資料夾，網址列輸入 cmd 按 Enter，再輸入 <code>python server.py --reset-admin</code>，會顯示臨時密碼。</td></tr>
+      <tr><td>其他問題</td><td>把畫面拍照給負責維護的人。詳細說明在資料夾裡的 <span class="file">README.md</span>。</td></tr>
+    </table>
+  </div>
+  <p><small>客戶資料只存在你們自己的電腦（<code>cnc.db</code> 與 <code>files</code> 資料夾）與你們設定的備份位置，不會上傳到任何雲端。</small></p>
+</main>
+</body>
+</html>
